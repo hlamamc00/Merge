@@ -141,3 +141,14 @@ describe('complianceSummary', () => {
     expect(complianceSummary(docs, 'CARE_ASSISTANT', NOW).status).toBe('COMPLIANT');
   });
 });
+
+describe('unavailability', () => {
+  it('blocks when the shift overlaps a worker unavailability window', () => {
+    const r = evaluateEligibility(shift(), worker({ unavailableWindows: [{ startsAt: addHours(START, -24), endsAt: addHours(START, 24) }] }), {
+      now: NOW,
+      bookedShifts: [],
+      access: openAccess,
+    });
+    expect(r.blockers.map((b) => b.code)).toEqual(['WORKER_UNAVAILABLE']);
+  });
+});

@@ -40,6 +40,8 @@ export interface EligibilityWorker {
   lat?: number | null;
   lng?: number | null;
   travelRadiusKm?: number | null;
+  /** Periods the worker has told their employer they are unavailable (leave, other commitments). */
+  unavailableWindows?: BookedShift[];
 }
 
 export interface EligibilityContext {
@@ -70,6 +72,7 @@ export type EligibilityCode =
   | 'LONG_SHIFT'
   | 'INSUFFICIENT_BREAK'
   | 'OUT_OF_TRAVEL_RANGE'
+  | 'WORKER_UNAVAILABLE'
   | 'SHIFT_IN_PAST';
 
 export interface EligibilityIssue {
@@ -142,6 +145,10 @@ export function evaluateEligibility(
     blockers.push({ code: 'NO_ACCESS', message: 'Your organisation is not included in this shift\'s release plan' });
   } else if (!ctx.access.open) {
     blockers.push({ code: 'ACCESS_NOT_OPEN', message: `This shift opens to your organisation at ${ctx.access.opensAt!.toISOString()}` });
+  }
+
+  if (worker.unavailableWindows && overlapsAny(shift, worker.unavailableWindows)) {
+    blockers.push({ code: 'WORKER_UNAVAILABLE', message: 'Worker has marked this time as unavailable' });
   }
 
   const overlap = overlapsAny(shift, booked);
