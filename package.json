@@ -1,0 +1,24 @@
+{
+  "name": "merge",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Merge – a shift-exchange platform that lets care companies lend and borrow staff, with capacity flags that give over-staffed companies first access to new shifts.",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspaces --if-present",
+    "dev:api": "npm run dev -w @merge/api",
+    "dev:web": "npm run dev -w @merge/web",
+    "build": "npm run build --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "db:migrate": "npm run db:migrate -w @merge/api",
+    "db:seed": "npm run db:seed -w @merge/api",
+    "db:reset": "npm run db:reset -w @merge/api"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
