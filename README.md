@@ -45,7 +45,7 @@ docs/             Architecture, domain model, dispatch rules, API reference, roa
 
 ## Quick start
 
-Requirements: Node 20+ (22 recommended) and npm 10+.
+Requirements: Node 24 LTS (the repo pins it in `.nvmrc`) and npm 11+. On Windows, install Node 24 before running `npm install`; the database library is compiled from source on other versions, which needs Visual Studio Build Tools.
 
 ```bash
 npm install

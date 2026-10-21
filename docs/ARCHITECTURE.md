@@ -4,7 +4,7 @@
 
 | Layer | Choice | Why |
 | --- | --- | --- |
-| Language | TypeScript everywhere (Node 22) | One domain model shared by API, rules engine and UI. |
+| Language | TypeScript everywhere (Node 24 LTS) | One domain model shared by API, rules engine and UI. |
 | Rules engine | `packages/shared` – pure functions, no I/O | Dispatch and eligibility are the product; keeping them pure makes them unit-testable and lets the UI explain decisions with the same code. |
 | API | Express 4, Zod validation, JWT auth | Small, well understood, easy to host anywhere. |
 | Database | Drizzle ORM on SQLite (better-sqlite3) | Zero-setup for development and demos; the schema uses plain column types so moving to Postgres is a driver swap plus regenerated migrations. |

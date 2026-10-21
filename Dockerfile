@@ -1,5 +1,5 @@
 # ---- build ----
-FROM node:22-slim AS build
+FROM node:24-slim AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
 COPY packages/shared/package.json packages/shared/
@@ -11,7 +11,7 @@ COPY . .
 RUN npm run build
 
 # ---- api ----
-FROM node:22-slim AS api
+FROM node:24-slim AS api
 WORKDIR /app
 ENV NODE_ENV=production DATABASE_URL=/data/merge.db PORT=4000
 COPY --from=build /app/node_modules ./node_modules

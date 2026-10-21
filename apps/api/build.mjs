@@ -8,7 +8,7 @@ await build({
   outfile: 'dist/server.js',
   bundle: true,
   platform: 'node',
-  target: 'node20',
+  target: 'node24',
   format: 'esm',
   sourcemap: true,
   logLevel: 'info',
