@@ -6,7 +6,8 @@ import type { Notifier } from '../lib/notify.js';
 import { buildPlan, notifyDueAccess, persistPlan } from './dispatch.js';
 import { releaseHoursFromFlag } from './capacity.js';
 import { shiftPaidHours } from '@merge/shared';
-import { deleteDraftTimesheet } from './timesheets.js';
+import { closeTimesheetForEndedBooking } from './timesheets.js';
+import { declinePendingForShift } from './assignments.js';
 
 export function publishShift(db: Db, notifier: Notifier, settings: PlatformSettingsRow, shift: Shift, site: Site, now: Date): Shift {
   const plan = buildPlan(db, settings, shift, site, now, now);
@@ -31,7 +32,7 @@ export function cancelShift(db: Db, notifier: Notifier, shift: Shift, reason: st
       .run();
     if (a.status === 'CONFIRMED') {
       releaseHoursFromFlag(db, a.matchedFlagId, hours, now);
-      deleteDraftTimesheet(db, a.id);
+      closeTimesheetForEndedBooking(db, a.id, reason ?? 'Shift cancelled by host', now);
     }
     notifier.send({
       orgId: a.supplierOrgId,
@@ -54,16 +55,13 @@ export function progressShifts(db: Db, notifier: Notifier, now: Date): { started
 
   const dueToStart = db.select().from(shifts).where(and(inArray(shifts.status, [ShiftStatus.OPEN, ShiftStatus.FILLED]), lte(shifts.startsAt, now))).all();
   for (const s of dueToStart) {
+    // Requests and offers that were never answered are closed so they stop counting as booked time for the worker.
+    declinePendingForShift(db, notifier, s, 'Shift started without confirmation', now);
     if (s.filledCount > 0) {
       db.update(shifts).set({ status: ShiftStatus.IN_PROGRESS, updatedAt: now }).where(eq(shifts.id, s.id)).run();
       started++;
     } else {
       db.update(shifts).set({ status: ShiftStatus.EXPIRED, updatedAt: now }).where(eq(shifts.id, s.id)).run();
-      // Pending requests that never got confirmed are closed off.
-      db.update(shiftAssignments)
-        .set({ status: 'DECLINED', respondedAt: now, note: 'Shift started without confirmation', updatedAt: now })
-        .where(and(eq(shiftAssignments.shiftId, s.id), inArray(shiftAssignments.status, ['REQUESTED', 'OFFERED'])))
-        .run();
       notifier.send({ orgId: s.hostOrgId, type: NotificationType.SHIFT_UNFILLED, title: `Shift went unfilled: ${s.title}`, body: `No worker was confirmed before the shift started at ${s.startsAt.toISOString()}.`, data: { shiftId: s.id } });
       expired++;
     }

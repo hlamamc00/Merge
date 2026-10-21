@@ -11,7 +11,6 @@ export interface GenerateInvoicesInput {
   /** Restrict to one host (payer) or one supplier (payee). */
   hostOrgId?: string;
   supplierOrgId?: string;
-  currency: string;
 }
 
 /**
@@ -23,18 +22,19 @@ export function generateInvoices(db: Db, notifier: Notifier, input: GenerateInvo
   const conditions = [eq(timesheets.status, TimesheetStatus.APPROVED), isNull(timesheets.invoiceId), gte(shifts.startsAt, input.periodStart), lt(shifts.startsAt, input.periodEnd)];
   if (input.hostOrgId) conditions.push(eq(timesheets.hostOrgId, input.hostOrgId));
   if (input.supplierOrgId) conditions.push(eq(timesheets.supplierOrgId, input.supplierOrgId));
-  const rows = db.select({ ts: timesheets }).from(timesheets).innerJoin(shifts, eq(shifts.id, timesheets.shiftId)).where(and(...conditions)).all();
+  const rows = db.select({ ts: timesheets, currency: shifts.currency }).from(timesheets).innerJoin(shifts, eq(shifts.id, timesheets.shiftId)).where(and(...conditions)).all();
 
+  // One statement per host / supplier / currency: amounts in different currencies are never summed together.
   const groups = new Map<string, typeof rows>();
   for (const r of rows) {
-    const key = `${r.ts.hostOrgId}|${r.ts.supplierOrgId}`;
+    const key = `${r.ts.hostOrgId}|${r.ts.supplierOrgId}|${r.currency}`;
     groups.set(key, [...(groups.get(key) ?? []), r]);
   }
 
   const created: Invoice[] = [];
   let seq = db.select({ id: invoices.id }).from(invoices).all().length;
   for (const [key, group] of groups) {
-    const [hostOrgId, supplierOrgId] = key.split('|') as [string, string];
+    const [hostOrgId, supplierOrgId, currency] = key.split('|') as [string, string, string];
     seq += 1;
     const id = newId('inv');
     const totals = group.reduce(
@@ -50,7 +50,7 @@ export function generateInvoices(db: Db, notifier: Notifier, input: GenerateInvo
         periodStart: input.periodStart,
         periodEnd: input.periodEnd,
         status: InvoiceStatus.ISSUED,
-        currency: input.currency,
+        currency,
         totalHours: round2(totals.hours),
         subtotal: round2(totals.subtotal),
         platformFee: round2(totals.fee),

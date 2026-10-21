@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { TimesheetStatus, UserRole } from '@merge/shared';
 import { organisations, shifts, timesheets, workers } from '../db/schema.js';
 import { auditFromReq } from '../lib/audit.js';
-import { MANAGERS, isPlatformAdmin, requireAuth, requireRole } from '../lib/auth.js';
+import { MANAGERS, isManager, isPlatformAdmin, requireAuth, requireRole } from '../lib/auth.js';
 import { auth, deps } from '../lib/context.js';
 import { forbidden, h, notFound } from '../lib/errors.js';
 import { parseBody, parseQuery, zDate } from '../lib/validate.js';
@@ -18,8 +18,9 @@ function load(req: Parameters<typeof deps>[0], id: string) {
   const row = db.select().from(timesheets).where(eq(timesheets.id, id)).get();
   if (!row) throw notFound('Timesheet');
   const { org, user } = auth(req);
-  const isHost = row.hostOrgId === org.id || isPlatformAdmin(req);
-  const isSupplier = row.supplierOrgId === org.id || isPlatformAdmin(req);
+  const manager = isManager(req); // workers never inherit organisation-wide access
+  const isHost = (manager && row.hostOrgId === org.id) || isPlatformAdmin(req);
+  const isSupplier = (manager && row.supplierOrgId === org.id) || isPlatformAdmin(req);
   const isWorker = user.role === UserRole.WORKER && user.workerId === row.workerId;
   if (!isHost && !isSupplier && !isWorker) throw forbidden();
   return { timesheet: row, isHost, isSupplier, isWorker };
@@ -75,8 +76,8 @@ timesheetsRouter.post(
   '/:id/clock-in',
   h((req, res) => {
     const { db, now } = deps(req);
-    const { timesheet, isHost, isSupplier, isWorker } = load(req, req.params.id!);
-    if (!isHost && !isSupplier && !isWorker) throw forbidden();
+    const { timesheet, isSupplier, isWorker } = load(req, req.params.id!);
+    if (!isSupplier && !isWorker) throw forbidden('Only the supplying organisation or the worker can record times');
     const body = parseBody(req, z.object({ at: zDate.optional(), lat: z.number().nullable().optional(), lng: z.number().nullable().optional() }));
     const at = now();
     const updated = ts.clockIn(db, timesheet, body.at ?? at, body, at);
@@ -89,7 +90,8 @@ timesheetsRouter.post(
   '/:id/clock-out',
   h((req, res) => {
     const { db, now, notifier } = deps(req);
-    const { timesheet } = load(req, req.params.id!);
+    const { timesheet, isSupplier, isWorker } = load(req, req.params.id!);
+    if (!isSupplier && !isWorker) throw forbidden('Only the supplying organisation or the worker can record times');
     const body = parseBody(req, z.object({ at: zDate.optional(), breakMinutes: z.number().int().min(0).max(240).optional() }));
     const at = now();
     const updated = ts.clockOut(db, notifier, timesheet, body.at ?? at, body.breakMinutes, at);

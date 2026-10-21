@@ -39,7 +39,7 @@ One row per organisation that will be able to see the shift: `tier` (`PRIORITY |
 A worker's involvement with a shift. `REQUESTED` (supplier → host) or `OFFERED` (host → worker) become `CONFIRMED`, or end `DECLINED | WITHDRAWN`. A confirmed booking may be `CANCELLED` (with `lateCancellation` when the supplier cancels inside the platform's late window) or recorded as `NO_SHOW`; it becomes `COMPLETED` when its timesheet is approved. Records `tierAtRequest` and `matchedFlagId` for fairness reporting.
 
 ## Timesheet
-Created as `DRAFT` on confirmation. Clock in/out (optionally with location) or manual submission → `SUBMITTED`; host → `APPROVED`, `DISPUTED` (supplier corrects and resubmits) or `REJECTED`. Money is snapshotted at confirmation: `chargeRate`, `platformFeePct`, and computed `paidHours`, `hostCost`, `platformFee`, `supplierAmount`.
+Created as `DRAFT` on confirmation. The supplier side (manager or worker) clocks in/out (optionally with location) or submits times manually → `SUBMITTED`; the host → `APPROVED`, `DISPUTED` (supplier corrects and resubmits) or `REJECTED`. If the booking is cancelled or marked a no-show, a draft timesheet is deleted and a submitted one is rejected; times can only be processed while the booking is `CONFIRMED`. Money is snapshotted at confirmation: `chargeRate`, `platformFeePct`, and computed `paidHours`, `hostCost`, `platformFee`, `supplierAmount`.
 
 ## Invoice (statement)
 Generated for a period per host/supplier pair from approved, un-invoiced timesheets. `subtotal` is what the host owes; `platformFee` is retained by the platform; `supplierAmount` is paid to the supplier. Status `ISSUED → PAID`.

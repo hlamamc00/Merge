@@ -81,8 +81,10 @@ Configuration lives in `apps/api/.env.example` (database path, port, JWT secret,
 ### Docker
 
 ```bash
-docker compose up --build   # API on :4000, web on :8080, SQLite volume persisted
+JWT_SECRET=$(openssl rand -hex 32) docker compose up --build   # API on :4000, web on :8080, SQLite volume persisted
 ```
+
+The API refuses to start with `NODE_ENV=production` unless `JWT_SECRET` is a random value of at least 32 characters.
 
 ## How priority works (short version)
 

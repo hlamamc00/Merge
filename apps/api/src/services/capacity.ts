@@ -56,10 +56,10 @@ export function withdrawFlag(db: Db, flag: CapacityFlag, now: Date): CapacityFla
 }
 
 /** Record hours covered against a surplus flag when an assignment is confirmed; fulfil it when the request is met. */
-export function applyHoursToFlag(db: Db, notifier: Notifier, flagId: string | null | undefined, hours: number, now: Date): void {
-  if (!flagId) return;
+export function applyHoursToFlag(db: Db, notifier: Notifier, flagId: string | null | undefined, hours: number, now: Date): boolean {
+  if (!flagId) return false;
   const flag = db.select().from(capacityFlags).where(eq(capacityFlags.id, flagId)).get();
-  if (!flag || flag.status !== CapacityFlagStatus.ACTIVE) return;
+  if (!flag || flag.status !== CapacityFlagStatus.ACTIVE) return false;
   const hoursFilled = flag.hoursFilled + hours;
   const fulfilled = hoursFilled >= flag.hoursRequested;
   db.update(capacityFlags)
@@ -75,6 +75,7 @@ export function applyHoursToFlag(db: Db, notifier: Notifier, flagId: string | nu
       data: { flagId: flag.id },
     });
   }
+  return true;
 }
 
 /** Give hours back to a flag when a confirmed assignment is cancelled. */

@@ -17,4 +17,10 @@ export const zDate = z
 
 export const zOptionalDate = zDate.nullable().optional();
 
+/** Query-string boolean: "false"/"0" are false (z.coerce.boolean would turn any non-empty string into true). */
+export const zQueryBool = z
+  .union([z.boolean(), z.enum(['true', 'false', '1', '0'])])
+  .optional()
+  .transform((v) => v === true || v === 'true' || v === '1');
+
 export const zPostcode = z.string().trim().min(2).max(10).transform((s) => s.toUpperCase());

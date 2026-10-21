@@ -107,7 +107,8 @@ export function evaluateEligibility(
   const warnings: EligibilityIssue[] = [];
 
   const shiftHours = shiftPaidHours(shift.startsAt, shift.endsAt, shift.breakMinutes);
-  const booked = ctx.bookedShifts.filter((b) => !(b.startsAt.getTime() === shift.startsAt.getTime() && b.endsAt.getTime() === shift.endsAt.getTime()));
+  // Callers exclude the candidate shift itself by id; every other booking counts, even one with identical times.
+  const booked = ctx.bookedShifts;
 
   if (shift.startsAt.getTime() <= ctx.now.getTime()) {
     blockers.push({ code: 'SHIFT_IN_PAST', message: 'The shift has already started' });

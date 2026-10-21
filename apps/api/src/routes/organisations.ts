@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { and, desc, eq, gte, inArray, sql } from 'drizzle-orm';
 import { z } from 'zod';
 import { RelationshipKind, ServiceType, UserRole, addDays } from '@merge/shared';
-import { orgRelationships, organisations, shiftAssignments, shifts, sites, timesheets, users } from '../db/schema.js';
+import { orgRelationships, organisations, shiftAssignments, shifts, sites, timesheets, users, workers } from '../db/schema.js';
 import { auditFromReq } from '../lib/audit.js';
 import { ADMINS, MANAGERS, assertOrgAccess, hashPassword, isPlatformAdmin, requireAuth, requireRole } from '../lib/auth.js';
 import { auth, deps } from '../lib/context.js';
@@ -105,6 +105,7 @@ organisationsRouter.get(
   '/:id/sites',
   h((req, res) => {
     const { db } = deps(req);
+    assertOrgAccess(req, req.params.id!); // site addresses and access notes are released per shift, never listed cross-org
     res.json(db.select().from(sites).where(eq(sites.orgId, req.params.id!)).all());
   }),
 );
@@ -236,10 +237,14 @@ organisationsRouter.post(
     );
     if (body.role === UserRole.PLATFORM_ADMIN && !isPlatformAdmin(req)) throw forbidden('Only platform administrators can create platform administrators');
     if (db.select({ id: users.id }).from(users).where(eq(users.email, body.email)).get()) throw conflict('An account with that email already exists');
+    const linkedWorker = body.workerId ? db.select().from(workers).where(and(eq(workers.id, body.workerId), eq(workers.orgId, orgId))).get() : undefined;
+    if (body.workerId && !linkedWorker) throw notFound('Worker');
+    if (linkedWorker?.userId) throw conflict('Worker already has a login');
     const id = newId('usr');
     const at = now();
-    db.insert(users).values({ id, orgId, email: body.email, passwordHash: await hashPassword(body.password), firstName: body.firstName, lastName: body.lastName, role: body.role, workerId: body.workerId ?? null, status: 'ACTIVE', createdAt: at }).run();
-    auditFromReq(req, db, { action: 'CREATE', entityType: 'user', entityId: id, data: { role: body.role } }, at);
+    db.insert(users).values({ id, orgId, email: body.email, passwordHash: await hashPassword(body.password), firstName: body.firstName, lastName: body.lastName, role: body.role, workerId: linkedWorker?.id ?? null, status: 'ACTIVE', createdAt: at }).run();
+    if (linkedWorker) db.update(workers).set({ userId: id, updatedAt: at }).where(eq(workers.id, linkedWorker.id)).run();
+    auditFromReq(req, db, { action: 'CREATE', entityType: 'user', entityId: id, data: { role: body.role, workerId: linkedWorker?.id } }, at);
     res.status(201).json(publicUser(db.select().from(users).where(eq(users.id, id)).get()!));
   }),
 );

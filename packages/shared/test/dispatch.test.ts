@@ -142,6 +142,15 @@ describe('planDispatch', () => {
     expect(at(AgencyPosition.LAST)).toEqual({ flagged: 0, plain: 120, agency: 180 });
   });
 
+  it('releases every tier at once when the host sets a zero priority window', () => {
+    const orgs = [org('flagged', { surplusFlags: [flag()] }), org('agency', { type: OrgType.AGENCY }), org('plain')];
+    for (const agencyPosition of Object.values(AgencyPosition)) {
+      const plan = planDispatch(shift({ priorityWindowMinutesOverride: 0 }), orgs, { ...DEFAULT_DISPATCH_SETTINGS, agencyPosition });
+      expect(plan.urgent).toBe(false);
+      expect(plan.entries.map((e) => e.opensAt.getTime())).toEqual([T0.getTime(), T0.getTime(), T0.getTime()]);
+    }
+  });
+
   it('lets an agency with its own surplus flag in with the priority tier', () => {
     const plan = planDispatch(shift(), [org('agency', { type: OrgType.AGENCY, surplusFlags: [flag()] })], {
       ...DEFAULT_DISPATCH_SETTINGS,

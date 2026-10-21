@@ -28,8 +28,25 @@ export function createDraftTimesheet(db: Db, settings: PlatformSettingsRow, shif
   return db.select().from(timesheets).where(eq(timesheets.id, id)).get()!;
 }
 
-export function deleteDraftTimesheet(db: Db, assignmentId: string): void {
-  db.delete(timesheets).where(and(eq(timesheets.assignmentId, assignmentId), eq(timesheets.status, TimesheetStatus.DRAFT))).run();
+/**
+ * When a booking ends abnormally (cancelled, no-show, shift cancelled) its timesheet must not be payable:
+ * drafts are deleted, submitted/disputed ones are rejected. Approved timesheets are left alone; money
+ * already owed is corrected on the statement, not by rewriting history.
+ */
+export function closeTimesheetForEndedBooking(db: Db, assignmentId: string, reason: string, now: Date): void {
+  const ts = db.select().from(timesheets).where(eq(timesheets.assignmentId, assignmentId)).get();
+  if (!ts) return;
+  if (ts.status === TimesheetStatus.DRAFT) {
+    db.delete(timesheets).where(eq(timesheets.id, ts.id)).run();
+  } else if (ts.status === TimesheetStatus.SUBMITTED || ts.status === TimesheetStatus.DISPUTED) {
+    db.update(timesheets).set({ status: TimesheetStatus.REJECTED, disputedAt: now, disputeReason: reason, updatedAt: now }).where(eq(timesheets.id, ts.id)).run();
+  }
+}
+
+/** Times can only be recorded, submitted or approved while the booking is still a confirmed one. */
+function assertBookingLive(db: Db, ts: Timesheet): void {
+  const assignment = db.select({ status: shiftAssignments.status }).from(shiftAssignments).where(eq(shiftAssignments.id, ts.assignmentId)).get();
+  if (!assignment || assignment.status !== 'CONFIRMED') throw conflict(`The booking is ${assignment ? assignment.status.toLowerCase().replace('_', ' ') : 'missing'}; its timesheet cannot be processed`);
 }
 
 function recompute(ts: Timesheet, clockInAt: Date, clockOutAt: Date, breakMinutes: number) {
@@ -41,6 +58,7 @@ function recompute(ts: Timesheet, clockInAt: Date, clockOutAt: Date, breakMinute
 export function clockIn(db: Db, ts: Timesheet, at: Date, geo: { lat?: number | null; lng?: number | null }, now: Date): Timesheet {
   if (ts.status !== TimesheetStatus.DRAFT) throw conflict('Timesheet is no longer editable');
   if (ts.clockInAt) throw conflict('Already clocked in');
+  assertBookingLive(db, ts);
   db.update(timesheets).set({ clockInAt: at, clockInLat: geo.lat ?? null, clockInLng: geo.lng ?? null, updatedAt: now }).where(eq(timesheets.id, ts.id)).run();
   return get(db, ts.id);
 }
@@ -48,6 +66,7 @@ export function clockIn(db: Db, ts: Timesheet, at: Date, geo: { lat?: number | n
 export function clockOut(db: Db, notifier: Notifier, ts: Timesheet, at: Date, breakMinutes: number | undefined, now: Date): Timesheet {
   if (ts.status !== TimesheetStatus.DRAFT) throw conflict('Timesheet is no longer editable');
   if (!ts.clockInAt) throw unprocessable('Clock in before clocking out');
+  assertBookingLive(db, ts);
   if (at.getTime() <= ts.clockInAt.getTime()) throw unprocessable('Clock-out must be after clock-in');
   const breaks = breakMinutes ?? ts.breakMinutes;
   db.update(timesheets)
@@ -62,6 +81,7 @@ export function clockOut(db: Db, notifier: Notifier, ts: Timesheet, at: Date, br
 export function submitTimes(db: Db, notifier: Notifier, ts: Timesheet, input: { clockInAt: Date; clockOutAt: Date; breakMinutes: number; notes?: string | null }, now: Date): Timesheet {
   if (ts.status !== TimesheetStatus.DRAFT && ts.status !== TimesheetStatus.DISPUTED && ts.status !== TimesheetStatus.SUBMITTED) throw conflict('Timesheet is no longer editable');
   if (input.clockOutAt.getTime() <= input.clockInAt.getTime()) throw unprocessable('Clock-out must be after clock-in');
+  assertBookingLive(db, ts);
   db.update(timesheets)
     .set({
       clockInAt: input.clockInAt,
@@ -83,6 +103,7 @@ export function submitTimes(db: Db, notifier: Notifier, ts: Timesheet, input: { 
 
 export function approve(db: Db, notifier: Notifier, ts: Timesheet, userId: string, now: Date): Timesheet {
   if (ts.status !== TimesheetStatus.SUBMITTED && ts.status !== TimesheetStatus.DISPUTED) throw conflict('Only submitted timesheets can be approved');
+  assertBookingLive(db, ts);
   db.update(timesheets).set({ status: TimesheetStatus.APPROVED, approvedAt: now, approvedByUserId: userId, updatedAt: now }).where(eq(timesheets.id, ts.id)).run();
   db.update(shiftAssignments).set({ status: 'COMPLETED', updatedAt: now }).where(eq(shiftAssignments.id, ts.assignmentId)).run();
   const updated = get(db, ts.id);
@@ -98,6 +119,7 @@ export function approve(db: Db, notifier: Notifier, ts: Timesheet, userId: strin
 
 export function dispute(db: Db, notifier: Notifier, ts: Timesheet, reason: string, now: Date): Timesheet {
   if (ts.status !== TimesheetStatus.SUBMITTED) throw conflict('Only submitted timesheets can be disputed');
+  assertBookingLive(db, ts);
   db.update(timesheets).set({ status: TimesheetStatus.DISPUTED, disputedAt: now, disputeReason: reason, updatedAt: now }).where(eq(timesheets.id, ts.id)).run();
   notifier.send({ orgId: ts.supplierOrgId, type: NotificationType.TIMESHEET_DISPUTED, title: 'Timesheet disputed', body: reason, data: { timesheetId: ts.id, shiftId: ts.shiftId } });
   return get(db, ts.id);

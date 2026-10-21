@@ -290,7 +290,10 @@ export interface DispatchPreview {
 export interface ShiftDetail extends Shift {
   site: Site;
   hostName: string;
+  /** The viewer's own organisation posted the shift. */
   isHost: boolean;
+  /** Host or platform admin: may see the full plan and all assignments and act for the host. */
+  canManage: boolean;
   access: Access | null;
   plan?: PlanEntry[];
   assignments: (Assignment & { supplierName: string; worker: WorkerSummary })[];

@@ -8,8 +8,8 @@ import { MANAGERS, assertOrgAccess, isManager, isPlatformAdmin, requireAuth, req
 import { auth, deps } from '../lib/context.js';
 import { conflict, forbidden, h, notFound, unprocessable } from '../lib/errors.js';
 import { newId } from '../lib/ids.js';
-import { parseBody, parseQuery, zDate } from '../lib/validate.js';
-import { offerShift, requestShift } from '../services/assignments.js';
+import { parseBody, parseQuery, zDate, zQueryBool } from '../lib/validate.js';
+import { declinePendingForShift, offerShift, requestShift } from '../services/assignments.js';
 import { accessFor, buildPlan, liveAccessReason, notifyDueAccess, planForShift } from '../services/dispatch.js';
 import { evaluateWorkerForShift } from '../services/eligibility.js';
 import { cancelShift, loadSiteForOrg, publishShift } from '../services/shifts.js';
@@ -44,6 +44,12 @@ function publicShift(s: Shift) {
   return { ...s, paidHours: shiftPaidHours(s.startsAt, s.endsAt, s.breakMinutes), placesLeft: Math.max(0, s.headcount - s.filledCount) };
 }
 
+/** What organisations other than the host get to see: no internal user ids. */
+function guestShift(s: Shift) {
+  const { createdByUserId: _c, ...rest } = publicShift(s);
+  return rest;
+}
+
 /**
  * scope=posted    shifts my organisation hosts
  * scope=available shifts other organisations have released (or will release) to mine
@@ -64,7 +70,7 @@ shiftsRouter.get(
         from: zDate.optional(),
         to: zDate.optional(),
         orgId: z.string().optional(),
-        includePast: z.coerce.boolean().default(false),
+        includePast: zQueryBool,
       }),
     );
     const at = now();
@@ -134,7 +140,7 @@ shiftsRouter.get(
         .all();
       return res.json(
         rows.map(({ assignment, shift, site, hostName, worker }) => ({
-          ...publicShift(shift),
+          ...guestShift(shift),
           site: siteForGuest(site),
           hostName,
           assignment,
@@ -164,7 +170,7 @@ shiftsRouter.get(
       rows
         .filter(({ shift }) => !myWorker || roleCanCover(myWorker.jobRole, shift.jobRole))
         .map(({ shift, site, hostName, access }) => ({
-          ...publicShift(shift),
+          ...guestShift(shift),
           site: siteForGuest(site),
           hostName,
           access: { tier: access.tier, opensAt: access.opensAt, open: access.opensAt.getTime() <= at.getTime(), reason: liveAccessReason(access.reason, access.matchedFlagId ? flagsById.get(access.matchedFlagId) : null) },
@@ -218,17 +224,19 @@ shiftsRouter.get(
     const { org, user } = auth(req);
     const { shift, site, hostName } = loadShift(req, req.params.id!);
     const at = now();
-    const isHost = shift.hostOrgId === org.id || isPlatformAdmin(req);
+    // isHost: the viewer's own organisation posted it. canManage: host or platform admin (oversight of any shift).
+    const isHost = shift.hostOrgId === org.id;
+    const canManage = isHost || isPlatformAdmin(req);
     const access = accessFor(db, shift.id, org.id, at);
     const hasAssignment = db.select({ id: shiftAssignments.id }).from(shiftAssignments).where(and(eq(shiftAssignments.shiftId, shift.id), eq(shiftAssignments.supplierOrgId, org.id))).get();
-    if (!isHost && !access.opensAt && !hasAssignment) throw forbidden('This shift has not been released to your organisation');
+    if (!canManage && !access.opensAt && !hasAssignment) throw forbidden('This shift has not been released to your organisation');
 
     const assignmentRows = db
       .select({ assignment: shiftAssignments, worker: workers, supplierName: organisations.name })
       .from(shiftAssignments)
       .innerJoin(workers, eq(workers.id, shiftAssignments.workerId))
       .innerJoin(organisations, eq(organisations.id, shiftAssignments.supplierOrgId))
-      .where(and(eq(shiftAssignments.shiftId, shift.id), isHost ? undefined : eq(shiftAssignments.supplierOrgId, org.id), user.role === UserRole.WORKER ? eq(shiftAssignments.workerId, user.workerId ?? '') : undefined))
+      .where(and(eq(shiftAssignments.shiftId, shift.id), canManage ? undefined : eq(shiftAssignments.supplierOrgId, org.id), user.role === UserRole.WORKER ? eq(shiftAssignments.workerId, user.workerId ?? '') : undefined))
       .orderBy(desc(shiftAssignments.createdAt))
       .all();
     const assignments = assignmentRows.map(({ assignment, worker, supplierName }) => ({
@@ -238,12 +246,13 @@ shiftsRouter.get(
     }));
 
     res.json({
-      ...publicShift(shift),
-      site: isHost ? site : siteForGuest(site),
+      ...(canManage ? publicShift(shift) : guestShift(shift)),
+      site: canManage ? site : siteForGuest(site),
       hostName,
       isHost,
+      canManage,
       access: isHost ? null : access,
-      plan: isHost ? planForShift(db, shift.id) : undefined,
+      plan: canManage ? planForShift(db, shift.id) : undefined,
       assignments,
     });
   }),
@@ -265,7 +274,12 @@ shiftsRouter.patch(
     } else if (shift.status === ShiftStatus.OPEN) {
       const body = parseBody(req, zShift.innerType().pick(Object.fromEntries(EDITABLE_WHEN_OPEN.map((k) => [k, true])) as Record<(typeof EDITABLE_WHEN_OPEN)[number], true>).partial());
       if (body.headcount !== undefined && body.headcount < shift.filledCount) throw conflict(`Headcount cannot be below the ${shift.filledCount} already confirmed`);
-      db.update(shifts).set({ ...body, status: body.headcount !== undefined && body.headcount <= shift.filledCount ? ShiftStatus.FILLED : shift.status, updatedAt: at }).where(eq(shifts.id, shift.id)).run();
+      if (body.breakMinutes !== undefined && body.breakMinutes !== shift.breakMinutes && shift.filledCount > 0) {
+        throw conflict('The break cannot be changed once workers are confirmed, because their paid hours and flag hours are already committed');
+      }
+      const nowFull = body.headcount !== undefined && body.headcount <= shift.filledCount;
+      db.update(shifts).set({ ...body, status: nowFull ? ShiftStatus.FILLED : shift.status, updatedAt: at }).where(eq(shifts.id, shift.id)).run();
+      if (nowFull) declinePendingForShift(db, notifier, db.select().from(shifts).where(eq(shifts.id, shift.id)).get()!, 'Shift filled by another worker', at);
       if (body.chargeRate !== undefined && body.chargeRate > shift.chargeRate) {
         // A rate rise is worth re-announcing to everyone who already has access.
         db.update(shiftAccess).set({ notifiedAt: null }).where(and(eq(shiftAccess.shiftId, shift.id), lte(shiftAccess.opensAt, at))).run();
@@ -342,7 +356,7 @@ shiftsRouter.get(
   h((req, res) => {
     const { db, now } = deps(req);
     const { org, settings } = auth(req);
-    const q = parseQuery(req, z.object({ orgId: z.string().optional(), allowHoursOverride: z.coerce.boolean().default(false) }));
+    const q = parseQuery(req, z.object({ orgId: z.string().optional(), allowHoursOverride: zQueryBool }));
     const supplierOrgId = q.orgId ?? org.id;
     assertOrgAccess(req, supplierOrgId);
     const { shift, site } = loadShift(req, req.params.id!);

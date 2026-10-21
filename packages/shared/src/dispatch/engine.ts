@@ -49,7 +49,7 @@ export interface DispatchShiftInput {
   sitePostcodeArea?: string | null;
   siteLat?: number | null;
   siteLng?: number | null;
-  /** Host may shorten (or lengthen) the priority window for this shift. */
+  /** Host may shorten (or lengthen) the priority window for this shift; 0 releases every tier immediately. */
   priorityWindowMinutesOverride?: number | null;
 }
 
@@ -169,8 +169,10 @@ export function computeStageTimes(shift: DispatchShiftInput, settings: DispatchS
   const lead = minutesBetween(t0, shift.startsAt);
   const urgent = lead <= settings.urgentThresholdMinutes;
 
-  const priorityWindow = urgent ? 0 : Math.max(0, shift.priorityWindowMinutesOverride ?? settings.priorityWindowMinutes);
-  const agencyWindow = urgent ? 0 : Math.max(0, settings.agencyWindowMinutes);
+  // An explicit 0 override means "no staged release": everyone is released at once, like an urgent shift.
+  const releaseAll = urgent || shift.priorityWindowMinutesOverride === 0;
+  const priorityWindow = releaseAll ? 0 : Math.max(0, shift.priorityWindowMinutesOverride ?? settings.priorityWindowMinutes);
+  const agencyWindow = releaseAll ? 0 : Math.max(0, settings.agencyWindowMinutes);
 
   let priority: Date;
   let agency: Date;

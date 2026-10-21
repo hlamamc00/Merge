@@ -14,6 +14,7 @@ import { fmtDateTime, fmtMoney, fmtShiftWindow, humanise } from '../lib/format';
 export function ShiftDetailPage() {
   const { id } = useParams();
   const { isWorker, isManager, me } = useAuth();
+  const myOrgId = me?.organisation.id;
   const q = useQuery({ queryKey: ['shift', id], queryFn: () => api.get<ShiftDetail>(`/shifts/${id}`), enabled: !!id, refetchInterval: 60_000 });
   if (q.isLoading) return <Loading />;
   if (q.error || !q.data) return <ErrorBanner error={q.error ?? 'Shift not found'} />;
@@ -29,7 +30,7 @@ export function ShiftDetailPage() {
           </span>
         }
         description={`${JOB_ROLE_LABELS[s.jobRole]} · ${s.hostName} · ${s.site.name}`}
-        actions={s.isHost && isManager ? <HostActions shift={s} /> : undefined}
+        actions={s.canManage && isManager ? <HostActions shift={s} /> : undefined}
       />
 
       {!s.isHost && s.access && <AccessBanner shift={s} />}
@@ -71,20 +72,24 @@ export function ShiftDetailPage() {
         </Card>
       </div>
 
-      {s.isHost ? (
+      {/* Host view (also platform-admin oversight of any shift). */}
+      {s.canManage && (
         <>
           <AssignmentsPanel shift={s} started={started} />
           {['OPEN', 'FILLED'].includes(s.status) && s.plan && <ReleasePlan entries={s.plan} urgent={s.urgent} />}
           {s.status === 'OPEN' && isManager && <CandidatesPanel shift={s} />}
         </>
-      ) : isWorker ? (
-        <WorkerRequestPanel shift={s} selfService={!!me?.organisation.workerSelfServiceAllowed} />
-      ) : (
-        <>
-          <MyAssignmentsPanel shift={s} />
-          {s.status === 'OPEN' && s.access?.opensAt && <PutForwardPanel shift={s} />}
-        </>
       )}
+      {/* Supplier view: anyone whose organisation is not the host, including the agency acting as its own bank. */}
+      {!s.isHost &&
+        (isWorker ? (
+          <WorkerRequestPanel shift={s} selfService={!!me?.organisation.workerSelfServiceAllowed} />
+        ) : (
+          <>
+            <MyAssignmentsPanel shift={s} orgId={myOrgId} />
+            {s.status === 'OPEN' && s.access?.opensAt && <PutForwardPanel shift={s} />}
+          </>
+        ))}
     </div>
   );
 }
@@ -303,7 +308,8 @@ function CandidatesPanel({ shift }: { shift: ShiftDetail }) {
 
 // ---------------- Supplier ----------------
 
-function MyAssignmentsPanel({ shift }: { shift: ShiftDetail }) {
+function MyAssignmentsPanel({ shift, orgId }: { shift: ShiftDetail; orgId?: string }) {
+  const mine = shift.assignments.filter((a) => !orgId || a.supplierOrgId === orgId);
   const [reason, setReason] = useState('');
   const [cancelFor, setCancelFor] = useState<Assignment | null>(null);
   const withdraw = useAction((id: string) => api.post(`/assignments/${id}/withdraw`));
@@ -311,12 +317,12 @@ function MyAssignmentsPanel({ shift }: { shift: ShiftDetail }) {
   const decline = useAction((id: string) => api.post(`/assignments/${id}/decline`, {}));
   const cancel = useAction((id: string) => api.post(`/assignments/${id}/cancel`, { reason: reason || null }), () => { setCancelFor(null); setReason(''); });
   const started = new Date(shift.startsAt).getTime() <= Date.now();
-  if (shift.assignments.length === 0) return null;
+  if (mine.length === 0) return null;
   return (
     <Card title="Your workers on this shift">
       <ErrorBanner error={withdraw.error ?? accept.error ?? decline.error ?? cancel.error} className="mb-3" />
       <ul className="divide-y divide-slate-100">
-        {shift.assignments.map((a) => (
+        {mine.map((a) => (
           <li key={a.id} className="flex flex-wrap items-center justify-between gap-3 py-2.5">
             <div>
               <div className="flex flex-wrap items-center gap-2 text-sm">

@@ -86,7 +86,14 @@ function GenerateModal({ open, onClose }: { open: boolean; onClose: () => void }
   const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
   const [form, setForm] = useState({ periodStart: toDateInput(monthStart), periodEnd: toDateInput(now) });
   const [result, setResult] = useState<Invoice[] | null>(null);
-  const gen = useAction(() => api.post<Invoice[]>('/invoices/generate', { periodStart: new Date(form.periodStart).toISOString(), periodEnd: new Date(`${form.periodEnd}T23:59:59`).toISOString() }), (r) => setResult(r));
+  // Both bounds are built in the browser's local frame and the end is exclusive (midnight after the last day),
+  // so consecutive periods tile exactly with no gap or overlap across clock changes.
+  const gen = useAction(() => {
+    const start = new Date(`${form.periodStart}T00:00:00`);
+    const end = new Date(`${form.periodEnd}T00:00:00`);
+    end.setDate(end.getDate() + 1);
+    return api.post<Invoice[]>('/invoices/generate', { periodStart: start.toISOString(), periodEnd: end.toISOString() });
+  }, (r) => setResult(r));
   return (
     <Modal open={open} onClose={() => { setResult(null); onClose(); }} title="Generate statements" footer={<><Button variant="secondary" onClick={() => { setResult(null); onClose(); }}>Close</Button><Button onClick={() => gen.mutate()} loading={gen.isPending}>Generate</Button></>}>
       <div className="space-y-3">

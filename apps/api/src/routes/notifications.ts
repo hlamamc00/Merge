@@ -6,7 +6,7 @@ import { notifications } from '../db/schema.js';
 import { requireAuth } from '../lib/auth.js';
 import { auth, deps } from '../lib/context.js';
 import { h } from '../lib/errors.js';
-import { parseQuery } from '../lib/validate.js';
+import { parseQuery, zQueryBool } from '../lib/validate.js';
 
 export const notificationsRouter = Router();
 notificationsRouter.use(requireAuth);
@@ -21,7 +21,7 @@ notificationsRouter.get(
   '/',
   h((req, res) => {
     const { db } = deps(req);
-    const q = parseQuery(req, z.object({ unread: z.coerce.boolean().default(false), limit: z.coerce.number().int().min(1).max(200).default(50) }));
+    const q = parseQuery(req, z.object({ unread: zQueryBool, limit: z.coerce.number().int().min(1).max(200).default(50) }));
     const rows = db
       .select()
       .from(notifications)

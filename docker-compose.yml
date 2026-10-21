@@ -5,7 +5,7 @@ services:
       target: api
     environment:
       DATABASE_URL: /data/merge.db
-      JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET to a random value of at least 32 characters}
       CORS_ORIGINS: http://localhost:8080
     volumes:
       - merge-data:/data

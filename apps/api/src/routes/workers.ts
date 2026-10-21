@@ -92,7 +92,7 @@ function loadWorker(req: Parameters<typeof deps>[0], id: string) {
   if (!w) throw notFound('Worker');
   const { user } = auth(req);
   const own = w.orgId === user.orgId || isPlatformAdmin(req);
-  const self = user.workerId === w.id;
+  const self = user.workerId === w.id && user.orgId === w.orgId;
   if (!own && !self) throw forbidden('That worker belongs to another organisation');
   return { worker: w, own, self };
 }

@@ -35,13 +35,26 @@ export function rangesOverlap(aStart: Date, aEnd: Date, bStart: Date, bEnd: Date
   return aStart.getTime() < bEnd.getTime() && bStart.getTime() < aEnd.getTime();
 }
 
-/** Monday 00:00 UTC of the ISO week containing `d`. */
-export function startOfIsoWeek(d: Date): Date {
-  const day = d.getUTCDay(); // 0 = Sunday
-  const diffToMonday = (day + 6) % 7;
-  const monday = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
-  monday.setUTCDate(monday.getUTCDate() - diffToMonday);
-  return monday;
+/** The time zone working-time weeks are counted in. */
+export const PLATFORM_TIME_ZONE = 'Europe/London';
+
+/** Offset (ms) of `timeZone` from UTC at instant `d`; positive east of Greenwich (BST = +3,600,000). */
+export function timeZoneOffsetMs(d: Date, timeZone = PLATFORM_TIME_ZONE): number {
+  const parts = new Intl.DateTimeFormat('en-GB', { timeZone, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }).formatToParts(d);
+  const n = (type: string) => Number(parts.find((p) => p.type === type)!.value);
+  const asUtc = Date.UTC(n('year'), n('month') - 1, n('day'), n('hour'), n('minute'), n('second'));
+  return asUtc - Math.floor(d.getTime() / 1000) * 1000;
+}
+
+/** Monday 00:00 local time (Europe/London) of the ISO week containing `d`, as an instant. */
+export function startOfIsoWeek(d: Date, timeZone = PLATFORM_TIME_ZONE): Date {
+  const offset = timeZoneOffsetMs(d, timeZone);
+  const local = new Date(d.getTime() + offset); // wall-clock fields readable via getUTC*
+  const diffToMonday = (local.getUTCDay() + 6) % 7;
+  const mondayLocalMidnight = Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate() - diffToMonday);
+  // Convert the local midnight back to an instant using the offset in force at that moment.
+  const guess = new Date(mondayLocalMidnight - offset);
+  return new Date(mondayLocalMidnight - timeZoneOffsetMs(guess, timeZone));
 }
 
 /** Paid hours for a shift once the unpaid break is removed. */

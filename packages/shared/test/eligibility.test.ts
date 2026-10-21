@@ -5,6 +5,7 @@ import {
   complianceSummary,
   evaluateEligibility,
   requiredDocumentsForRole,
+  startOfIsoWeek,
   type EligibilityShift,
   type EligibilityWorker,
   type ComplianceDocumentLike,
@@ -84,6 +85,14 @@ describe('evaluateEligibility', () => {
     expect(r2.blockers.map((b) => b.code)).toEqual(['OVERLAPPING_SHIFT']);
   });
 
+  it('counts a booking with identical times as an overlap (no silent self-exclusion)', () => {
+    const twin = { startsAt: START, endsAt: addHours(START, 8), breakMinutes: 30 };
+    const r = evaluateEligibility(shift(), worker({ maxHoursPerWeek: 10 }), { now: NOW, bookedShifts: [twin], access: openAccess });
+    expect(r.eligible).toBe(false);
+    expect(r.blockers.map((b) => b.code)).toEqual(['OVERLAPPING_SHIFT', 'WEEKLY_HOURS_EXCEEDED']);
+    expect(r.facts.weeklyHoursAfter).toBe(15);
+  });
+
   it('enforces the weekly hours cap, with an override for opted-out workers', () => {
     const monday = new Date('2026-11-02T07:00:00Z');
     const booked = [0, 1, 4, 5].map((d) => ({ startsAt: addDays(monday, d), endsAt: addHours(addDays(monday, d), 12), breakMinutes: 0 }));
@@ -116,6 +125,21 @@ describe('evaluateEligibility', () => {
     const r = evaluateEligibility(shift(), worker({ documents: docs }), { now: NOW, bookedShifts: [], access: openAccess });
     expect(r.blockers.map((b) => b.code)).toEqual(['NON_COMPLIANT']);
     expect(r.blockers[0]!.message).toMatch(/dbs expired/i);
+  });
+});
+
+describe('working-time weeks', () => {
+  it('starts the week at Monday 00:00 Europe/London, not UTC, during British Summer Time', () => {
+    // Mon 1 June 2026 00:30 BST is Sun 31 May 23:30Z; it belongs to the week starting 1 June.
+    const bstMondayEarly = new Date('2026-05-31T23:30:00Z');
+    expect(startOfIsoWeek(bstMondayEarly).toISOString()).toBe('2026-05-31T23:00:00.000Z');
+    // In winter (GMT) local midnight and UTC midnight coincide.
+    expect(startOfIsoWeek(new Date('2026-11-04T07:00:00Z')).toISOString()).toBe('2026-11-02T00:00:00.000Z');
+    // Hours booked in the previous (BST) week must not count against a shift in the new week.
+    const previousWeek = [0, 1, 2, 3].map((d) => ({ startsAt: addDays(new Date('2026-05-25T06:00:00Z'), d), endsAt: addHours(addDays(new Date('2026-05-25T06:00:00Z'), d), 11) }));
+    const r = evaluateEligibility(shift({ startsAt: bstMondayEarly, endsAt: addHours(bstMondayEarly, 8) }), worker(), { now: new Date('2026-05-20T09:00:00Z'), bookedShifts: previousWeek, access: openAccess });
+    expect(r.blockers.map((b) => b.code)).toEqual([]);
+    expect(r.facts.weeklyHoursAfter).toBe(7.5);
   });
 });
 

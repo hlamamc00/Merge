@@ -7,7 +7,7 @@ import { newId } from '../lib/ids.js';
 import type { Notifier } from '../lib/notify.js';
 import { applyHoursToFlag, releaseHoursFromFlag } from './capacity.js';
 import { evaluateWorkerForShift } from './eligibility.js';
-import { createDraftTimesheet, deleteDraftTimesheet } from './timesheets.js';
+import { closeTimesheetForEndedBooking, createDraftTimesheet } from './timesheets.js';
 
 interface Actor {
   userId: string;
@@ -155,21 +155,12 @@ export function confirmAssignment(
   db.update(shifts).set({ filledCount, status: nowFull ? ShiftStatus.FILLED : ShiftStatus.OPEN, updatedAt: now }).where(eq(shifts.id, shift.id)).run();
 
   const hours = shiftPaidHours(shift.startsAt, shift.endsAt, shift.breakMinutes);
-  applyHoursToFlag(db, notifier, assignment.matchedFlagId, hours, now);
+  const applied = applyHoursToFlag(db, notifier, assignment.matchedFlagId, hours, now);
+  // Only bookings whose hours actually counted against a flag may give them back on cancellation.
+  if (!applied && assignment.matchedFlagId) db.update(shiftAssignments).set({ matchedFlagId: null, updatedAt: now }).where(eq(shiftAssignments.id, assignment.id)).run();
   createDraftTimesheet(db, settings, shift, getAssignment(db, assignment.id), now);
 
-  if (nowFull) {
-    // Everyone else still waiting is let down gently.
-    const others = db
-      .select()
-      .from(shiftAssignments)
-      .where(and(eq(shiftAssignments.shiftId, shift.id), inArray(shiftAssignments.status, ['REQUESTED', 'OFFERED'])))
-      .all();
-    for (const o of others) {
-      db.update(shiftAssignments).set({ status: AssignmentStatus.DECLINED, respondedAt: now, note: 'Shift filled by another worker', updatedAt: now }).where(eq(shiftAssignments.id, o.id)).run();
-      notifier.send({ orgId: o.supplierOrgId, type: NotificationType.SHIFT_DECLINED, title: `Shift filled: ${shift.title}`, body: 'The shift was filled before your request was confirmed.', data: { shiftId: shift.id, assignmentId: o.id } });
-    }
-  }
+  if (nowFull) declinePendingForShift(db, notifier, shift, 'Shift filled by another worker', now);
 
   const hostName = orgName(db, shift.hostOrgId);
   notifier.send({
@@ -190,6 +181,20 @@ export function confirmAssignment(
     });
   }
   return getAssignment(db, assignment.id);
+}
+
+/** Close every REQUESTED/OFFERED row on a shift that can no longer take them, telling each supplier why. */
+export function declinePendingForShift(db: Db, notifier: Notifier, shift: Shift, note: string, now: Date): number {
+  const pending = db
+    .select()
+    .from(shiftAssignments)
+    .where(and(eq(shiftAssignments.shiftId, shift.id), inArray(shiftAssignments.status, ['REQUESTED', 'OFFERED'])))
+    .all();
+  for (const p of pending) {
+    db.update(shiftAssignments).set({ status: AssignmentStatus.DECLINED, respondedAt: now, note, updatedAt: now }).where(eq(shiftAssignments.id, p.id)).run();
+    notifier.send({ orgId: p.supplierOrgId, type: NotificationType.SHIFT_DECLINED, title: `Not needed: ${shift.title}`, body: `${note}.`, data: { shiftId: shift.id, assignmentId: p.id } });
+  }
+  return pending.length;
 }
 
 export function declineAssignment(db: Db, notifier: Notifier, assignment: ShiftAssignment, actor: Actor, reason: string | null, now: Date): ShiftAssignment {
@@ -222,7 +227,7 @@ export function cancelAssignment(db: Db, notifier: Notifier, settings: PlatformS
   const filledCount = Math.max(0, shift.filledCount - 1);
   db.update(shifts).set({ filledCount, status: shift.status === ShiftStatus.FILLED ? ShiftStatus.OPEN : shift.status, updatedAt: now }).where(eq(shifts.id, shift.id)).run();
   releaseHoursFromFlag(db, assignment.matchedFlagId, shiftPaidHours(shift.startsAt, shift.endsAt, shift.breakMinutes), now);
-  deleteDraftTimesheet(db, assignment.id);
+  closeTimesheetForEndedBooking(db, assignment.id, 'Booking cancelled', now);
 
   const worker = db.select().from(workers).where(eq(workers.id, assignment.workerId)).get()!;
   const toOrg = bySupplier ? shift.hostOrgId : assignment.supplierOrgId;
@@ -241,7 +246,7 @@ export function recordNoShow(db: Db, notifier: Notifier, assignment: ShiftAssign
   const shift = getShift(db, assignment.shiftId);
   if (shift.startsAt.getTime() > now.getTime()) throw conflict('The shift has not started yet');
   db.update(shiftAssignments).set({ status: AssignmentStatus.NO_SHOW, respondedByUserId: actor.userId, updatedAt: now }).where(eq(shiftAssignments.id, assignment.id)).run();
-  deleteDraftTimesheet(db, assignment.id);
+  closeTimesheetForEndedBooking(db, assignment.id, 'No-show recorded by the host', now);
   const worker = db.select().from(workers).where(eq(workers.id, assignment.workerId)).get()!;
   notifier.send({ orgId: assignment.supplierOrgId, type: NotificationType.SHIFT_CANCELLED, title: `No-show recorded: ${workerName(worker)}`, body: `${orgName(db, shift.hostOrgId)} reported that the worker did not attend ${shift.title} on ${shift.startsAt.toISOString()}.`, data: { shiftId: shift.id, assignmentId: assignment.id } });
   return getAssignment(db, assignment.id);

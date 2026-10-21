@@ -32,7 +32,7 @@ If the agency itself raises a matching surplus flag, its bank never waits longer
 
 ### Windows and urgency
 
-- `priorityWindowMinutes` (default 120) and `agencyWindowMinutes` (default 60) are platform settings; a host may override the priority window per shift (e.g. 0 to release to everyone at once, or longer for a shift far in the future).
+- `priorityWindowMinutes` (default 120) and `agencyWindowMinutes` (default 60) are platform settings; a host may override the priority window per shift: longer for a shift far in the future, or **0 to release every tier at once** (priority organisations are still notified first).
 - **Urgent**: if the shift starts within `urgentThresholdMinutes` (default 12 h) of publication, every stage opens immediately and the shift is flagged urgent. Priority organisations are still notified first (ordering), they just do not get exclusivity.
 - **Minimum lead**: no stage may open later than `minLeadBeforeStartMinutes` (default 60) before the shift starts, so windows are clamped for shifts posted at short notice.
 

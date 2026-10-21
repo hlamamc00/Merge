@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { UserRole } from '@merge/shared';
 import { organisations, ratings, shiftAssignments, shifts, sites, timesheets, workers } from '../db/schema.js';
 import { auditFromReq } from '../lib/audit.js';
-import { MANAGERS, isPlatformAdmin, requireAuth, requireRole } from '../lib/auth.js';
+import { MANAGERS, isManager, isPlatformAdmin, requireAuth, requireRole } from '../lib/auth.js';
 import { auth, deps } from '../lib/context.js';
 import { conflict, forbidden, h, notFound } from '../lib/errors.js';
 import { newId } from '../lib/ids.js';
@@ -25,8 +25,9 @@ function load(req: Parameters<typeof deps>[0], id: string) {
     .get();
   if (!row) throw notFound('Assignment');
   const { org, user } = auth(req);
-  const isHost = row.shift.hostOrgId === org.id || isPlatformAdmin(req);
-  const isSupplier = row.assignment.supplierOrgId === org.id || isPlatformAdmin(req);
+  const manager = isManager(req); // workers never inherit organisation-wide access
+  const isHost = (manager && row.shift.hostOrgId === org.id) || isPlatformAdmin(req);
+  const isSupplier = (manager && row.assignment.supplierOrgId === org.id) || isPlatformAdmin(req);
   const isWorker = user.role === UserRole.WORKER && user.workerId === row.assignment.workerId;
   if (!isHost && !isSupplier && !isWorker) throw forbidden();
   return { ...row, isHost, isSupplier, isWorker };

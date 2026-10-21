@@ -72,7 +72,8 @@ Handlers never contain business rules; services never read HTTP. Every service t
 
 - JWT bearer tokens; passwords hashed with bcrypt.
 - Four roles. Platform admins (agency staff) may act on any organisation; everyone else only on their own. Workers only on themselves.
-- Data minimisation across organisations: hosts see worker name, role, skills and ratings, never pay rates or notes; suppliers see site address and access notes only for shifts released to them; capacity flags are aggregated for providers and itemised only for the platform admin.
+- Data minimisation across organisations: hosts see worker name, role, skills and ratings, never pay rates or notes; suppliers see site address and access notes only for shifts released to them (site lists are never readable cross-organisation); capacity flags are aggregated for providers and itemised only for the platform admin; workers with a login see only their own bookings and timesheets, never colleagues'.
+- Working-time weeks run Monday 00:00 to Sunday 24:00 in Europe/London, so the 48 h cap behaves correctly across the BST/GMT changes.
 - Every state change writes an `audit_log` row with actor, action, entity and payload.
 
 ## Deployment notes

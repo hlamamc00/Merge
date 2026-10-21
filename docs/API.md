@@ -19,7 +19,7 @@ Roles: **PA** platform admin (agency), **OA** org admin, **OM** org manager, **W
 | GET | `/organisations/:id` | any |
 | PATCH | `/organisations/:id` | OA/PA (`status` only PA) |
 | GET | `/organisations/:id/stats` | managers |
-| GET/POST | `/organisations/:id/sites` | any / managers |
+| GET/POST | `/organisations/:id/sites` | own organisation / managers |
 | PATCH/DELETE | `/organisations/:id/sites/:siteId` | managers |
 | GET | `/organisations/:id/relationships` | managers |
 | PUT/DELETE | `/organisations/:id/relationships/:otherOrgId` | OA/PA – body `{ kind: PREFERRED|BLOCKED, note? }` |
@@ -52,7 +52,7 @@ Roles: **PA** platform admin (agency), **OA** org admin, **OM** org manager, **W
 | --- | --- | --- |
 | GET | `/shifts?scope=posted|available|supplied|all&status&jobRole&from&to&includePast` | see below |
 | POST | `/shifts` | managers – shift fields + `publish: boolean` |
-| GET | `/shifts/:id` | host, or an organisation in its plan |
+| GET | `/shifts/:id` | host, platform admin, or an organisation in its plan (`isHost`, `canManage`) |
 | PATCH | `/shifts/:id` | host managers (full edit while DRAFT; limited while OPEN) |
 | POST | `/shifts/:id/publish` | host managers |
 | POST | `/shifts/:id/cancel` | host managers – `{ reason? }` |
@@ -82,8 +82,8 @@ Scopes: `posted` = my organisation hosts (managers); `available` = released or s
 | --- | --- | --- |
 | GET | `/timesheets?scope=payable|receivable|all&status=A,B` | any (workers: own) |
 | GET | `/timesheets/:id` | host, supplier or worker |
-| POST | `/timesheets/:id/clock-in` | host, supplier or worker – `{ at?, lat?, lng? }` |
-| POST | `/timesheets/:id/clock-out` | same – `{ at?, breakMinutes? }` → SUBMITTED |
+| POST | `/timesheets/:id/clock-in` | supplier or worker – `{ at?, lat?, lng? }` |
+| POST | `/timesheets/:id/clock-out` | supplier or worker – `{ at?, breakMinutes? }` → SUBMITTED |
 | POST | `/timesheets/:id/submit` | supplier or worker – `{ clockInAt, clockOutAt, breakMinutes, notes? }` |
 | POST | `/timesheets/:id/approve` | host managers |
 | POST | `/timesheets/:id/dispute` | host managers – `{ reason }` |

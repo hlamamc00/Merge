@@ -368,3 +368,99 @@ describe('live flag state in access reasons', () => {
     expect(after.body.plan.find((p: { orgId: string }) => p.orgId === riverside.orgId).reason).toBe('Surplus flag: 24.5h of 40h remaining, care assistant');
   });
 });
+
+describe('review regressions', () => {
+  it('does not list another organisation\'s sites', async () => {
+    expect((await api.get(`/api/v1/organisations/${oakwood.orgId}/sites`).set(auth(pennine.token))).status).toBe(403);
+    expect((await api.get(`/api/v1/organisations/${oakwood.orgId}/sites`).set(auth(oakwood.token))).status).toBe(200);
+    expect((await api.get(`/api/v1/organisations/${oakwood.orgId}/sites`).set(auth(agency.token))).status).toBe(200);
+  });
+
+  it('refuses to bind a login to another organisation\'s worker', async () => {
+    const res = await api.post(`/api/v1/organisations/${oakwood.orgId}/users`).set(auth(oakwood.token)).send({ email: 'sneaky@oakwood.example', password: 'password123', firstName: 'S', lastName: 'Neaky', role: 'ORG_MANAGER', workerId: rivWorker.id });
+    expect(res.status).toBe(404);
+    const own = await api.post(`/api/v1/organisations/${riverside.orgId}/users`).set(auth(riverside.token)).send({ email: 'george@riverside.example', password: 'password123', firstName: 'George', lastName: 'Worker', role: 'WORKER', workerId: rivNonCompliant.id });
+    expect(own.status).toBe(201);
+    const w = await api.get(`/api/v1/workers/${rivNonCompliant.id}`).set(auth(riverside.token));
+    expect(w.body.login.id).toBe(own.body.id);
+  });
+
+  it('keeps a worker login out of colleagues\' timesheets and assignments', async () => {
+    const session = await api.post('/api/v1/auth/login').send({ email: 'george@riverside.example', password: 'password123' });
+    const token = session.body.token as string;
+    const list = await api.get('/api/v1/timesheets').set(auth(token));
+    expect(list.status).toBe(200);
+    expect(list.body).toEqual([]); // George has no bookings; Aisha's timesheets stay hidden
+    const aishaTs = (await api.get('/api/v1/timesheets?scope=receivable').set(auth(riverside.token))).body[0];
+    expect((await api.get(`/api/v1/timesheets/${aishaTs.id}`).set(auth(token))).status).toBe(403);
+    expect((await api.post(`/api/v1/timesheets/${aishaTs.id}/submit`).set(auth(token)).send({ clockInAt: T0.toISOString(), clockOutAt: addHours(T0, 12).toISOString(), breakMinutes: 0 })).status).toBe(403);
+    expect((await api.get(`/api/v1/assignments/${aishaTs.assignmentId}`).set(auth(token))).status).toBe(403);
+  });
+
+  it('parses query booleans literally', async () => {
+    const first = (await api.get('/api/v1/notifications').set(auth(oakwood.token))).body.notifications[0];
+    expect((await api.post(`/api/v1/notifications/${first.id}/read`).set(auth(oakwood.token))).status).toBe(200);
+    const all = await api.get('/api/v1/notifications?unread=false').set(auth(oakwood.token));
+    const unreadOnly = await api.get('/api/v1/notifications?unread=true').set(auth(oakwood.token));
+    expect(all.body.notifications.length).toBeGreaterThan(unreadOnly.body.notifications.length);
+    expect(all.body.notifications.some((n: { id: string }) => n.id === first.id)).toBe(true);
+    expect(unreadOnly.body.notifications.some((n: { id: string }) => n.id === first.id)).toBe(false);
+    const upcoming = await api.get('/api/v1/shifts?scope=posted&includePast=false').set(auth(oakwood.token));
+    const everything = await api.get('/api/v1/shifts?scope=posted&includePast=true').set(auth(oakwood.token));
+    expect(upcoming.body.length).toBeLessThan(everything.body.length);
+  });
+
+  it('rejects a submitted timesheet when the booking is cancelled, so it can never be approved or invoiced', async () => {
+    const res = await api.post('/api/v1/shifts').set(auth(oakwood.token)).send({ siteId: oakSite.id, jobRole: 'CARE_ASSISTANT', title: 'Cancel after submit', startsAt: addDays(clock, 8).toISOString(), endsAt: addHours(addDays(clock, 8), 8).toISOString(), chargeRate: 18, autoConfirm: true, priorityWindowMinutesOverride: 0, publish: true });
+    // The agency now goes FIRST (changed by an earlier test); a zero priority window releases every tier at once anyway.
+    expect(res.body.plan.every((p: { opensAt: string }) => new Date(p.opensAt).getTime() === clock.getTime())).toBe(true);
+    const booked = await api.post(`/api/v1/shifts/${res.body.id}/requests`).set(auth(riverside.token)).send({ workerId: rivWorker.id });
+    expect(booked.status).toBe(201);
+    expect(booked.body.assignment.status).toBe('CONFIRMED');
+    const ts = (await api.get('/api/v1/timesheets?scope=receivable&status=DRAFT').set(auth(riverside.token))).body.find((t: { assignmentId: string }) => t.assignmentId === booked.body.assignment.id);
+    const submitted = await api.post(`/api/v1/timesheets/${ts.id}/submit`).set(auth(riverside.token)).send({ clockInAt: addDays(clock, 8).toISOString(), clockOutAt: addHours(addDays(clock, 8), 8).toISOString(), breakMinutes: 0 });
+    expect(submitted.body.status).toBe('SUBMITTED');
+    // Host cannot record times itself
+    expect((await api.post(`/api/v1/timesheets/${ts.id}/clock-in`).set(auth(oakwood.token)).send({})).status).toBe(403);
+    const cancel = await api.post(`/api/v1/assignments/${booked.body.assignment.id}/cancel`).set(auth(riverside.token)).send({ reason: 'Sick' });
+    expect(cancel.status).toBe(200);
+    const after = await api.get(`/api/v1/timesheets/${ts.id}`).set(auth(oakwood.token));
+    expect(after.body.status).toBe('REJECTED');
+    expect((await api.post(`/api/v1/timesheets/${ts.id}/approve`).set(auth(oakwood.token))).status).toBe(409);
+    const assignment = await api.get(`/api/v1/assignments/${booked.body.assignment.id}`).set(auth(oakwood.token));
+    expect(assignment.body.status).toBe('CANCELLED');
+  });
+
+  it('closes pending requests when a shift starts and blocks break edits after confirmations', async () => {
+    const res = await api.post('/api/v1/shifts').set(auth(oakwood.token)).send({ siteId: oakSite.id, jobRole: 'CARE_ASSISTANT', title: 'Starts soon', startsAt: addHours(clock, 2).toISOString(), endsAt: addHours(clock, 10).toISOString(), breakMinutes: 30, headcount: 2, chargeRate: 18, publish: true });
+    expect(res.body.urgent).toBe(true);
+    const a = await api.post(`/api/v1/shifts/${res.body.id}/requests`).set(auth(riverside.token)).send({ workerId: rivWorker.id });
+    expect(a.status).toBe(201);
+    const confirm = await api.post(`/api/v1/assignments/${a.body.assignment.id}/confirm`).set(auth(oakwood.token));
+    expect(confirm.body.status).toBe('CONFIRMED');
+    expect((await api.patch(`/api/v1/shifts/${res.body.id}`).set(auth(oakwood.token)).send({ breakMinutes: 60 })).status).toBe(409);
+    const b = await api.post(`/api/v1/shifts/${res.body.id}/requests`).set(auth(pennine.token)).send({ workerId: penWorker.id });
+    expect(b.status).toBe(201);
+    expect(b.body.assignment.status).toBe('REQUESTED');
+    clock = addHours(clock, 2.1);
+    await api.post('/api/v1/admin/scheduler/tick').set(auth(agency.token));
+    const shift = await api.get(`/api/v1/shifts/${res.body.id}`).set(auth(oakwood.token));
+    expect(shift.body.status).toBe('IN_PROGRESS');
+    const pennineRow = shift.body.assignments.find((x: { id: string }) => x.id === b.body.assignment.id);
+    expect(pennineRow.status).toBe('DECLINED');
+    const penInbox = await api.get('/api/v1/notifications').set(auth(pennine.token));
+    expect(penInbox.body.notifications.some((n: { type: string; data: { assignmentId: string } }) => n.type === 'SHIFT_DECLINED' && n.data.assignmentId === b.body.assignment.id)).toBe(true);
+  });
+
+  it('gives the platform admin oversight without pretending it is the host', async () => {
+    const posted = await api.get('/api/v1/shifts?scope=all').set(auth(agency.token));
+    const open = posted.body.find((s: { status: string; hostOrgId: string }) => s.status === 'OPEN' && s.hostOrgId === oakwood.orgId);
+    const detail = await api.get(`/api/v1/shifts/${open.id}`).set(auth(agency.token));
+    expect(detail.body.isHost).toBe(false);
+    expect(detail.body.canManage).toBe(true);
+    expect(detail.body.plan).toBeDefined();
+    expect(detail.body.access).toBeDefined();
+    const asGuest = await api.get(`/api/v1/shifts?scope=available`).set(auth(riverside.token));
+    expect(asGuest.body.every((s: Record<string, unknown>) => !('createdByUserId' in s))).toBe(true);
+  });
+});
