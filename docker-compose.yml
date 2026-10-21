@@ -1,0 +1,25 @@
+services:
+  api:
+    build:
+      context: .
+      target: api
+    environment:
+      DATABASE_URL: /data/merge.db
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+      CORS_ORIGINS: http://localhost:8080
+    volumes:
+      - merge-data:/data
+    ports:
+      - "4000:4000"
+
+  web:
+    build:
+      context: .
+      target: web
+    depends_on:
+      - api
+    ports:
+      - "8080:80"
+
+volumes:
+  merge-data:
