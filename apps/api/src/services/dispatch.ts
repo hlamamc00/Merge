@@ -147,7 +147,8 @@ export interface AccessInfo {
 export function accessFor(db: Db, shiftId: string, orgId: string, now: Date): AccessInfo {
   const row = db.select().from(shiftAccess).where(and(eq(shiftAccess.shiftId, shiftId), eq(shiftAccess.orgId, orgId))).get();
   if (!row) return { open: false };
-  return { open: row.opensAt.getTime() <= now.getTime(), opensAt: row.opensAt, tier: row.tier, reason: row.reason, matchedFlagId: row.matchedFlagId };
+  const flag = row.matchedFlagId ? db.select().from(capacityFlags).where(eq(capacityFlags.id, row.matchedFlagId)).get() : null;
+  return { open: row.opensAt.getTime() <= now.getTime(), opensAt: row.opensAt, tier: row.tier, reason: liveAccessReason(row.reason, flag), matchedFlagId: row.matchedFlagId };
 }
 
 /**
@@ -180,7 +181,19 @@ export function notifyDueAccess(db: Db, notifier: Notifier, now: Date): number {
   return due.length;
 }
 
-/** Full plan for display (host, admin): rows with organisation names. */
+/**
+ * The reason stored on an access row is a snapshot taken at publish time. When it came from a surplus
+ * flag, rebuild it from the flag's current state so "40h of 40h remaining" stays true after bookings.
+ */
+export function liveAccessReason(storedReason: string, flag: { jobRole: string | null; hoursRequested: number; hoursFilled: number; status: string } | null | undefined): string {
+  if (!flag) return storedReason;
+  const remaining = Math.max(0, flag.hoursRequested - flag.hoursFilled);
+  const role = flag.jobRole ? flag.jobRole.toLowerCase().replace(/_/g, ' ') : 'any role';
+  const state = flag.status === 'ACTIVE' ? `${remaining}h of ${flag.hoursRequested}h remaining` : `${flag.status.toLowerCase()}, ${flag.hoursFilled}h of ${flag.hoursRequested}h placed`;
+  return storedReason.startsWith('Surplus flag') ? `Surplus flag: ${state}, ${role}` : storedReason.replace(/\(.*\)$/, `(${state}, ${role})`);
+}
+
+/** Full plan for display (host, admin): rows with organisation names and up-to-date flag state. */
 export function planForShift(db: Db, shiftId: string) {
   return db
     .select({
@@ -193,10 +206,13 @@ export function planForShift(db: Db, shiftId: string) {
       reason: shiftAccess.reason,
       matchedFlagId: shiftAccess.matchedFlagId,
       notifiedAt: shiftAccess.notifiedAt,
+      flag: { jobRole: capacityFlags.jobRole, hoursRequested: capacityFlags.hoursRequested, hoursFilled: capacityFlags.hoursFilled, status: capacityFlags.status },
     })
     .from(shiftAccess)
     .innerJoin(organisations, eq(organisations.id, shiftAccess.orgId))
+    .leftJoin(capacityFlags, eq(capacityFlags.id, shiftAccess.matchedFlagId))
     .where(eq(shiftAccess.shiftId, shiftId))
     .orderBy(shiftAccess.opensAt, sql`case ${shiftAccess.tier} when 'PRIORITY' then 0 when 'AGENCY' then 1 else 2 end`, shiftAccess.rank)
-    .all();
+    .all()
+    .map(({ flag, ...row }) => ({ ...row, reason: liveAccessReason(row.reason, flag?.hoursRequested != null ? flag : null) }));
 }

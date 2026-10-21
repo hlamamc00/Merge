@@ -1,0 +1,19 @@
+@import "tailwindcss";
+
+@theme {
+  --color-brand-50: #eef7f6;
+  --color-brand-100: #d5ecea;
+  --color-brand-200: #abd9d5;
+  --color-brand-300: #78c0ba;
+  --color-brand-400: #4aa39c;
+  --color-brand-500: #2f8780;
+  --color-brand-600: #256c67;
+  --color-brand-700: #205753;
+  --color-brand-800: #1c4643;
+  --color-brand-900: #193b39;
+}
+
+html, body, #root { height: 100%; }
+body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+
+input[type="datetime-local"], input[type="date"] { color-scheme: light; }

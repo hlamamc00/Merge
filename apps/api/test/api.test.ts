@@ -348,3 +348,23 @@ describe('other dispatch behaviours', () => {
     expect(overview.body.organisations.total).toBe(4);
   });
 });
+
+describe('live flag state in access reasons', () => {
+  it('reflects hours consumed since publication', async () => {
+    // "Next week" was published when Riverside's flag had 32.5h left; Aisha then requested it.
+    const posted = await api.get('/api/v1/shifts?scope=posted').set(auth(oakwood.token));
+    const next = posted.body.find((s: { title: string }) => s.title === 'Next week');
+    const before = await api.get(`/api/v1/shifts/${next.id}`).set(auth(oakwood.token));
+    const pending = before.body.assignments.find((a: { status: string }) => a.status === 'REQUESTED');
+    expect(before.body.plan.find((p: { orgId: string }) => p.orgId === riverside.orgId).reason).toBe('Surplus flag: 32.5h of 40h remaining, care assistant');
+
+    const confirm = await api.post(`/api/v1/assignments/${pending.id}/confirm`).set(auth(oakwood.token));
+    expect(confirm.status).toBe(200);
+
+    const flags = await api.get('/api/v1/capacity/flags').set(auth(riverside.token));
+    const rivFlag = flags.body.find((f: { kind: string; jobRole: string }) => f.kind === 'SURPLUS' && f.jobRole === 'CARE_ASSISTANT');
+    expect(rivFlag.hoursRemaining).toBe(24.5);
+    const after = await api.get(`/api/v1/shifts/${next.id}`).set(auth(oakwood.token));
+    expect(after.body.plan.find((p: { orgId: string }) => p.orgId === riverside.orgId).reason).toBe('Surplus flag: 24.5h of 40h remaining, care assistant');
+  });
+});

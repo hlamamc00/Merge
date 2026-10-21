@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { and, asc, desc, eq, gt, gte, inArray, lte } from 'drizzle-orm';
 import { z } from 'zod';
 import { DocumentType, JobRole, ShiftStatus, ShiftVisibility, Skill, UserRole, roleCanCover, shiftPaidHours } from '@merge/shared';
-import { organisations, ratings, shiftAccess, shiftAssignments, shifts, sites, workers, type Shift } from '../db/schema.js';
+import { capacityFlags, organisations, ratings, shiftAccess, shiftAssignments, shifts, sites, workers, type Shift } from '../db/schema.js';
 import { auditFromReq } from '../lib/audit.js';
 import { MANAGERS, assertOrgAccess, isManager, isPlatformAdmin, requireAuth, requireRole } from '../lib/auth.js';
 import { auth, deps } from '../lib/context.js';
@@ -10,7 +10,7 @@ import { conflict, forbidden, h, notFound, unprocessable } from '../lib/errors.j
 import { newId } from '../lib/ids.js';
 import { parseBody, parseQuery, zDate } from '../lib/validate.js';
 import { offerShift, requestShift } from '../services/assignments.js';
-import { accessFor, buildPlan, notifyDueAccess, planForShift } from '../services/dispatch.js';
+import { accessFor, buildPlan, liveAccessReason, notifyDueAccess, planForShift } from '../services/dispatch.js';
 import { evaluateWorkerForShift } from '../services/eligibility.js';
 import { cancelShift, loadSiteForOrg, publishShift } from '../services/shifts.js';
 
@@ -158,6 +158,8 @@ shiftsRouter.get(
     const mine = rows.length
       ? db.select().from(shiftAssignments).where(and(inArray(shiftAssignments.shiftId, rows.map((r) => r.shift.id)), eq(shiftAssignments.supplierOrgId, org.id), inArray(shiftAssignments.status, ['REQUESTED', 'OFFERED', 'CONFIRMED']))).all()
       : [];
+    const flagIds = rows.map((r) => r.access.matchedFlagId).filter((f): f is string => !!f);
+    const flagsById = new Map(flagIds.length ? db.select().from(capacityFlags).where(inArray(capacityFlags.id, flagIds)).all().map((f) => [f.id, f]) : []);
     res.json(
       rows
         .filter(({ shift }) => !myWorker || roleCanCover(myWorker.jobRole, shift.jobRole))
@@ -165,7 +167,7 @@ shiftsRouter.get(
           ...publicShift(shift),
           site: siteForGuest(site),
           hostName,
-          access: { tier: access.tier, opensAt: access.opensAt, open: access.opensAt.getTime() <= at.getTime(), reason: access.reason },
+          access: { tier: access.tier, opensAt: access.opensAt, open: access.opensAt.getTime() <= at.getTime(), reason: liveAccessReason(access.reason, access.matchedFlagId ? flagsById.get(access.matchedFlagId) : null) },
           myAssignments: mine.filter((a) => a.shiftId === shift.id),
         })),
     );
