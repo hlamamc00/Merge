@@ -14,11 +14,11 @@ Decisions taken by the platform owner in response to the six-month simulation ([
 | 8 | WF-03 | Assume full contracted hours unless told otherwise | Yes. | Decided 2026-10-22 |
 | 9 | WF-01 | Do verified documents and ratings follow a worker to a new employer (with consent)? | Yes. | Decided 2026-10-22 |
 | 10 | ONB-03, PH-01, PH-03 | One organisation with site-scoped managers, or parent and child organisations? | Explanation requested. | Awaiting decision |
-| 11 | PR-02 | Compliance evidence that may cross organisations | | Open |
-| 12 | PT-01 | Checks before a new organisation joins | Default taken: manual approval by the platform admin (registration creates a PENDING organisation). | Open: CQC check and data-sharing agreement |
-| 13 | SEC-01, PT-02 | Controller/processor stance; operator access to tenant data | | Open (needs legal view) |
-| 14 | PC-01 | Safeguarding concerns: visibility, mediation, right of reply | | Open |
-| 15 | COM-01, ONB-02 | Email and SMS providers; who pays for SMS | | Open |
-| 16 | PT-03 | Two-factor authentication and single sign-on | | Open |
-| 17 | PT-06 | Which rota systems to integrate first | | Open |
+| 11 | PR-02 | Compliance evidence that may cross organisations | Each employer is responsible for ensuring its workers meet the standard mandatory requirements for care workers; hosts see a "meets mandatory requirements" status, not document details. Anything beyond the standard (specific training such as PEG feeding) is stated on the platform by the host, and suppliers declare which workers hold it. | Decided 2026-10-22 |
+| 12 | PT-01 | Checks before a new organisation joins | Must be a legitimate care company (CQC registration or equivalent, checked at approval) and must agree to the memorandum of understanding (MOU) before approval. Registration creates a PENDING organisation; the platform admin approves. | Decided 2026-10-22 |
+| 13 | SEC-01, PT-02 | Controller/processor stance; operator access to tenant data | The operator holds worker data to run the platform but does not need to see worker pay rates or DBS details; those stay with the employer (consistent with 11). | Decided 2026-10-22 for access. Open: whether the operator is a data controller or a processor (needs a legal view). |
+| 14 | PC-01, PM-01, PM-02 | Safeguarding concerns about a lent worker | The worker is accountable to their employer. Under the MOU every employer must have a framework for handling reports about a lent worker from the host. The platform records a report and passes it to the employer; it does not mediate. Hosts can bar individual workers from their shifts. | Decided 2026-10-22 |
+| 15 | COM-01, ONB-02 | Email and SMS providers; who pays for SMS | To be decided at deployment. Build against a provider-neutral channel interface. | Deferred |
+| 16 | PT-03 | Two-factor authentication and single sign-on | Two-factor authentication is compulsory for admins and managers. | Decided 2026-10-22. Open: which sign-in providers (Microsoft assumed as the first). |
+| 17 | PT-06 | Which rota systems to integrate first | Depends on what clients use; to be done after go-live. | Deferred |
 | 18 | CMP-03 | Document storage and retention | | Open |
