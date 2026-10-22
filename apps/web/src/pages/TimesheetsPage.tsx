@@ -3,9 +3,10 @@ import { Link } from 'react-router-dom';
 import { api } from '../api/client';
 import { useAction, useTimesheets } from '../api/hooks';
 import type { TimesheetListItem } from '../api/types';
+import { EXCEPTION_LABELS, type BulkApproveResponse, type TimesheetRow } from '../api/types.finance';
 import { useAuth } from '../auth/AuthContext';
 import { StatusBadge } from '../components/badges';
-import { Button, Card, ErrorBanner, Field, Input, Loading, Modal, PageHeader, Select, Table, Tabs, Textarea } from '../components/ui';
+import { Badge, Button, Card, ErrorBanner, Field, InfoBanner, Input, Loading, Modal, PageHeader, Select, Table, Tabs, Textarea } from '../components/ui';
 import { fmtDateTime, fmtHours, fmtMoney, fmtShiftWindow, toLocalInput, fromLocalInput } from '../lib/format';
 
 type Tab = 'payable' | 'receivable';
@@ -18,39 +19,62 @@ export function TimesheetsPage() {
   const [reasonFor, setReasonFor] = useState<{ ts: TimesheetListItem; action: 'dispute' | 'reject' } | null>(null);
   const [submitFor, setSubmitFor] = useState<TimesheetListItem | null>(null);
   const [reason, setReason] = useState('');
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [bulkResult, setBulkResult] = useState<BulkApproveResponse | null>(null);
 
   const clockIn = useAction((id: string) => api.post(`/timesheets/${id}/clock-in`, {}));
   const clockOut = useAction((id: string) => api.post(`/timesheets/${id}/clock-out`, {}));
   const approve = useAction((id: string) => api.post(`/timesheets/${id}/approve`));
   const disputeOrReject = useAction((args: { id: string; action: 'dispute' | 'reject' }) => api.post(`/timesheets/${args.id}/${args.action}`, { reason }), () => { setReasonFor(null); setReason(''); });
-  const error = clockIn.error ?? clockOut.error ?? approve.error ?? disputeOrReject.error;
+  const bulkApprove = useAction((ids: string[]) => api.post<BulkApproveResponse>('/timesheets/bulk-approve', { ids }), (r) => { setBulkResult(r); setSelected(new Set()); });
+  const error = clockIn.error ?? clockOut.error ?? approve.error ?? disputeOrReject.error ?? bulkApprove.error;
 
   const payable = tab === 'payable';
+  const rows = (q.data ?? []) as TimesheetRow[];
+  const approvable = payable && isManager ? rows.filter((t) => t.status === 'SUBMITTED' || t.status === 'DISPUTED') : [];
+  const allSelected = approvable.length > 0 && approvable.every((t) => selected.has(t.id));
+  const toggle = (id: string) => setSelected((prev) => { const next = new Set(prev); if (next.has(id)) next.delete(id); else next.add(id); return next; });
+  const toggleAll = () => setSelected(allSelected ? new Set() : new Set(approvable.map((t) => t.id)));
+  const selectedCount = approvable.filter((t) => selected.has(t.id)).length;
+  const switchTab = (t: Tab) => { setTab(t); setSelected(new Set()); setBulkResult(null); };
   return (
     <div className="space-y-5">
       <PageHeader title="Timesheets" description={isWorker ? 'Clock in and out of your shifts. Your employer and the host approve the hours.' : 'Hours worked on exchanged shifts. Hosts approve what they pay; suppliers submit what their workers did.'} />
       <Card>
-        {!isWorker && <Tabs tabs={[{ value: 'payable', label: 'Payable (shifts we hosted)' }, { value: 'receivable', label: 'Receivable (shifts we covered)' }]} value={tab} onChange={setTab} />}
-        <div className="mb-3 max-w-xs">
-          <Field label="Status">
+        {!isWorker && <Tabs tabs={[{ value: 'payable', label: 'Payable (shifts we hosted)' }, { value: 'receivable', label: 'Receivable (shifts we covered)' }]} value={tab} onChange={switchTab} />}
+        <div className="mb-3 flex flex-wrap items-end gap-3">
+          <Field label="Status" className="w-48">
             <Select value={status} onChange={(e) => setStatus(e.target.value)}>
               <option value="">All</option>
               {['DRAFT', 'SUBMITTED', 'APPROVED', 'DISPUTED', 'REJECTED'].map((s) => <option key={s} value={s}>{s.toLowerCase()}</option>)}
             </Select>
           </Field>
+          {approvable.length > 0 && (
+            <div className="flex items-center gap-2">
+              <Button size="sm" variant="success" disabled={selectedCount === 0} loading={bulkApprove.isPending} onClick={() => bulkApprove.mutate(approvable.filter((t) => selected.has(t.id)).map((t) => t.id))}>Approve selected ({selectedCount})</Button>
+              <span className="text-xs text-slate-500">{approvable.length} awaiting approval{approvable.some((t) => t.exceptions?.length) && ' · check the flagged ones first'}</span>
+            </div>
+          )}
         </div>
+        {bulkResult && (
+          <InfoBanner tone={bulkResult.failed ? 'amber' : 'green'} className="mb-3">
+            {bulkResult.approved} approved{bulkResult.failed ? `, ${bulkResult.failed} not approved: ${bulkResult.results.filter((r) => !r.ok).map((r) => r.error).join('; ')}` : '.'}
+          </InfoBanner>
+        )}
         <ErrorBanner error={error ?? q.error} className="mb-3" />
         {q.isLoading ? <Loading /> : (
-          <Table
-            rows={q.data ?? []}
+          <Table<TimesheetRow>
+            rows={rows}
             rowKey={(t) => t.id}
             columns={[
+              ...(approvable.length > 0 ? [{ key: 'select', header: <input type="checkbox" aria-label="Select all awaiting approval" checked={allSelected} onChange={toggleAll} className="h-4 w-4 rounded border-slate-300" />, render: (t: TimesheetRow) => (t.status === 'SUBMITTED' || t.status === 'DISPUTED') && <input type="checkbox" aria-label="Select timesheet" checked={selected.has(t.id)} onChange={() => toggle(t.id)} className="h-4 w-4 rounded border-slate-300" /> }] : []),
               { key: 'shift', header: 'Shift', render: (t) => <div><Link to={`/shifts/${t.shift.id}`} className="font-medium text-slate-900 hover:underline">{t.shift.title}</Link><div className="text-xs text-slate-500">{fmtShiftWindow(t.shift.startsAt, t.shift.endsAt, t.shift.breakMinutes)}</div></div> },
               { key: 'who', header: payable ? 'Worker / supplier' : 'Worker / host', render: (t) => <div>{t.worker.firstName} {t.worker.lastName}<div className="text-xs text-slate-500">{payable ? t.supplierName : t.hostName}</div></div> },
               { key: 'times', header: 'Clocked', render: (t) => (t.clockInAt ? <div className="text-xs">{fmtDateTime(t.clockInAt)}<br />{t.clockOutAt ? fmtDateTime(t.clockOutAt) : <span className="text-emerald-700">on shift</span>}</div> : <span className="text-xs text-slate-400">Not clocked in</span>) },
               { key: 'hours', header: 'Paid hours', align: 'right', render: (t) => fmtHours(t.paidHours) },
               { key: 'money', header: payable ? 'You pay' : 'You receive', align: 'right', render: (t) => <div>{fmtMoney(payable ? t.hostCost : t.supplierAmount)}<div className="text-xs text-slate-400">{fmtMoney(t.chargeRate)}/h{isPlatformAdmin && ` · fee ${fmtMoney(t.platformFee)}`}</div></div> },
               { key: 'status', header: 'Status', render: (t) => <div><StatusBadge status={t.status} />{t.disputeReason && <div className="mt-1 max-w-[180px] text-xs text-rose-700">{t.disputeReason}</div>}</div> },
+              { key: 'exceptions', header: 'Check', render: (t) => (t.exceptions?.length ? <span className="flex flex-wrap gap-1">{t.exceptions.map((e) => <Badge key={e} tone={e === 'MISSING_CLOCK_OUT' ? 'red' : 'amber'}>{EXCEPTION_LABELS[e]}</Badge>)}</span> : <span className="text-xs text-slate-300">–</span>) },
               { key: 'actions', header: '', align: 'right', render: (t) => (
                 <span className="flex flex-wrap justify-end gap-1">
                   {!payable && t.status === 'DRAFT' && !t.clockInAt && <Button size="sm" onClick={() => clockIn.mutate(t.id)} loading={clockIn.isPending}>Clock in</Button>}

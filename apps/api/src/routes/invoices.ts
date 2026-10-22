@@ -58,13 +58,18 @@ invoicesRouter.get(
   }),
 );
 
-/** Turn approved timesheets into statements. Platform admins can run it network-wide; org admins only for their own organisation. */
+/**
+ * Turn approved timesheets into settlement lines. Platform admins can run it network-wide; org admins only for
+ * their own organisation.
+ * @deprecated Prefer `POST /finance/run`, which produces the same lines and then rolls them into the host
+ * invoices and supplier remittances that are actually paid. Kept for existing clients and the simulation harness.
+ */
 invoicesRouter.post(
   '/generate',
   requireRole(...ADMINS),
   h((req, res) => {
     const { db, now, notifier } = deps(req);
-    const { org } = auth(req);
+    const { org, settings } = auth(req);
     const body = parseBody(req, z.object({ periodStart: zDate, periodEnd: zDate, hostOrgId: z.string().optional(), supplierOrgId: z.string().optional() }).refine((b) => b.periodEnd > b.periodStart, { message: 'periodEnd must be after periodStart' }));
     if (!isPlatformAdmin(req)) {
       if (body.hostOrgId && body.hostOrgId !== org.id) throw forbidden();
@@ -72,7 +77,7 @@ invoicesRouter.post(
       if (!body.hostOrgId && !body.supplierOrgId) body.hostOrgId = org.id;
     }
     const at = now();
-    const created = generateInvoices(db, notifier, body, at);
+    const created = generateInvoices(db, notifier, body, at, { ownerOrgId: settings.ownerOrgId });
     for (const inv of created) auditFromReq(req, db, { action: 'CREATE', entityType: 'invoice', entityId: inv.id, data: { number: inv.number } }, at);
     res.status(201).json(created);
   }),

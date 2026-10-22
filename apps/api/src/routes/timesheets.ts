@@ -29,8 +29,9 @@ function load(req: Parameters<typeof deps>[0], id: string) {
 timesheetsRouter.get(
   '/',
   h((req, res) => {
-    const { db } = deps(req);
+    const { db, now } = deps(req);
     const { org, user } = auth(req);
+    const at = now();
     const q = parseQuery(req, z.object({ scope: z.enum(['payable', 'receivable', 'all']).default(user.role === UserRole.WORKER ? 'receivable' : 'payable'), status: z.string().optional() }));
     const statuses = q.status ? (q.status.split(',') as TimesheetStatus[]) : undefined;
     if (q.scope === 'all' && !isPlatformAdmin(req)) throw forbidden();
@@ -57,8 +58,25 @@ timesheetsRouter.get(
         supplierName: supplierNames[timesheet.supplierOrgId],
         worker: { id: worker.id, firstName: worker.firstName, lastName: worker.lastName, jobRole: worker.jobRole },
         shift: { id: shift.id, title: shift.title, jobRole: shift.jobRole, startsAt: shift.startsAt, endsAt: shift.endsAt, breakMinutes: shift.breakMinutes },
+        exceptions: ts.timesheetExceptions(timesheet, shift, at),
       })),
     );
+  }),
+);
+
+/** Approve many timesheets at once; returns one result per id so a bad one does not block the rest. */
+timesheetsRouter.post(
+  '/bulk-approve',
+  requireRole(...MANAGERS),
+  h((req, res) => {
+    const { db, now, notifier } = deps(req);
+    const { org, user } = auth(req);
+    const body = parseBody(req, z.object({ ids: z.array(z.string()).min(1).max(500) }));
+    const at = now();
+    const platform = isPlatformAdmin(req);
+    const results = ts.bulkApprove(db, notifier, body.ids, (row) => platform || row.hostOrgId === org.id, user.id, at);
+    for (const r of results) if (r.ok) auditFromReq(req, db, { action: 'UPDATE', entityType: 'timesheet', entityId: r.id, data: { status: 'APPROVED', bulk: true } }, at);
+    res.json({ approved: results.filter((r) => r.ok).length, failed: results.filter((r) => !r.ok).length, results });
   }),
 );
 
