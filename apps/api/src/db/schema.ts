@@ -49,6 +49,25 @@ export const platformSettings = sqliteTable('platform_settings', {
   maxShiftHours: real('max_shift_hours').notNull().default(14),
   /** Cancelling a confirmed assignment inside this many hours of the start counts as a late cancellation. */
   lateCancellationHours: real('late_cancellation_hours').notNull().default(24),
+  /** Decision 3: floor charge = minimum wage × (1 + on-cost %) ÷ (1 − platform fee %). */
+  nationalMinimumWage: real('national_minimum_wage').notNull().default(12.71),
+  employerOnCostPct: real('employer_on_cost_pct').notNull().default(25),
+  /** Decision 4: repeated no-shows by an employer's workers. */
+  noShowWindowDays: integer('no_show_window_days').notNull().default(90),
+  noShowPriorityPenaltyThreshold: integer('no_show_priority_penalty_threshold').notNull().default(2),
+  noShowPriorityPenaltyDays: integer('no_show_priority_penalty_days').notNull().default(30),
+  noShowSuspensionThreshold: integer('no_show_suspension_threshold').notNull().default(3),
+  /** Decision 7: remind the operator about an unanswered request. */
+  requestReminderHours: real('request_reminder_hours').notNull().default(12),
+  requestReminderBeforeStartHours: real('request_reminder_before_start_hours').notNull().default(24),
+  /** Decision 18. */
+  documentRetentionYears: integer('document_retention_years').notNull().default(6),
+  /** Decision 12: the memorandum of understanding every organisation accepts. */
+  mouVersion: text('mou_version').notNull().default('1.0'),
+  /** Decision 16. */
+  twoFactorRequiredForManagers: bool('two_factor_required_for_managers').notNull().default(true),
+  /** Decision 6 default for new hosts. */
+  defaultEscalationMode: text('default_escalation_mode').$type<'MANUAL' | 'AUTO'>().notNull().default('MANUAL'),
   updatedAt: ts('updated_at').notNull(),
 });
 
@@ -70,6 +89,19 @@ export const organisations = sqliteTable('organisations', {
   defaultChargeRate: real('default_charge_rate'),
   /** Whether this organisation lets its own workers request shifts themselves (rather than a manager assigning). */
   workerSelfServiceAllowed: bool('worker_self_service_allowed').notNull().default(false),
+  /** Decision 12: MOU acceptance recorded at registration. */
+  mouAcceptedAt: ts('mou_accepted_at'),
+  mouVersion: text('mou_version'),
+  mouAcceptedByUserId: text('mou_accepted_by_user_id'),
+  /** Decision 6: how this host handles shifts still open close to their start. */
+  escalationMode: text('escalation_mode').$type<'MANUAL' | 'AUTO'>().notNull().default('MANUAL'),
+  /** Maximum automatic uplift on the charge rate, as a percentage of the original rate. */
+  escalationCeilingPct: real('escalation_ceiling_pct').notNull().default(20),
+  /** Decision 4: priority access removed until this time after repeated no-shows. */
+  priorityPenaltyUntil: ts('priority_penalty_until'),
+  suspendedReason: text('suspended_reason'),
+  /** Decision 1: hosts overdue on platform invoices cannot post until cleared. */
+  creditHold: bool('credit_hold').notNull().default(false),
   createdAt: ts('created_at').notNull(),
   updatedAt: ts('updated_at').notNull(),
 });
@@ -86,6 +118,15 @@ export const users = sqliteTable(
     lastName: text('last_name').notNull(),
     role: text('role').$type<UserRole>().notNull(),
     status: text('status').notNull().default('ACTIVE'),
+    /** Decision 10: a manager limited to these sites; null = every site of the organisation. */
+    siteIds: json<string[]>('site_ids'),
+    phone: text('phone'),
+    mustChangePassword: bool('must_change_password').notNull().default(false),
+    /** Decision 16: authenticator-app two-factor. */
+    totpSecret: text('totp_secret'),
+    totpEnabledAt: ts('totp_enabled_at'),
+    failedLoginCount: integer('failed_login_count').notNull().default(0),
+    lockedUntil: ts('locked_until'),
     lastLoginAt: ts('last_login_at'),
     createdAt: ts('created_at').notNull(),
   },
@@ -147,10 +188,14 @@ export const workers = sqliteTable(
     /** Private to the employer: what the employer pays the worker. Never exposed to other organisations. */
     hourlyPayRate: real('hourly_pay_rate'),
     notes: text('notes'),
+    /** Decision 10: the site this worker is based at. */
+    homeSiteId: text('home_site_id'),
+    /** Decision 14 / data protection: consent to be shown to other organisations. */
+    consentToShareAt: ts('consent_to_share_at'),
     createdAt: ts('created_at').notNull(),
     updatedAt: ts('updated_at').notNull(),
   },
-  (t) => ({ orgIdx: index('workers_org_idx').on(t.orgId) }),
+  (t) => ({ orgIdx: index('workers_org_idx').on(t.orgId), homeSiteIdx: index('workers_home_site_idx').on(t.homeSiteId) }),
 );
 
 export const workerDocuments = sqliteTable(
@@ -166,6 +211,15 @@ export const workerDocuments = sqliteTable(
     verifiedAt: ts('verified_at'),
     verifiedByUserId: text('verified_by_user_id'),
     notes: text('notes'),
+    /** Uploaded file (decision 18): key in the storage adapter. */
+    fileKey: text('file_key'),
+    fileName: text('file_name'),
+    mimeType: text('mime_type'),
+    fileSize: integer('file_size'),
+    uploadedByUserId: text('uploaded_by_user_id'),
+    /** Verified documents are immutable: a correction creates a new row that replaces the old one. */
+    replacesDocumentId: text('replaces_document_id'),
+    supersededAt: ts('superseded_at'),
     createdAt: ts('created_at').notNull(),
   },
   (t) => ({ workerIdx: index('worker_documents_worker_idx').on(t.workerId) }),
@@ -231,6 +285,14 @@ export const shifts = sqliteTable(
     priorityWindowMinutesOverride: integer('priority_window_minutes_override'),
     /** First eligible request is confirmed automatically. */
     autoConfirm: bool('auto_confirm').notNull().default(false),
+    /** Decision 6: automatic escalation state. */
+    originalChargeRate: real('original_charge_rate'),
+    escalationStep: integer('escalation_step').notNull().default(0),
+    lastEscalatedAt: ts('last_escalated_at'),
+    /** Recurring posting: shifts created together share a series. */
+    seriesId: text('series_id'),
+    /** Decision 11: host-specific requirements (ids in host_requirements) a worker must hold. */
+    requiredHostRequirementIds: json<string[]>('required_host_requirement_ids').notNull().default([]),
     status: text('status').$type<ShiftStatus>().notNull().default('DRAFT'),
     urgent: bool('urgent').notNull().default(false),
     publishedAt: ts('published_at'),
@@ -287,6 +349,8 @@ export const shiftAssignments = sqliteTable(
     lateCancellation: bool('late_cancellation').notNull().default(false),
     hoursOverride: bool('hours_override').notNull().default(false),
     note: text('note'),
+    /** Decision 7: when the operator was reminded that this request is still unanswered. */
+    operatorRemindedAt: ts('operator_reminded_at'),
     createdAt: ts('created_at').notNull(),
     updatedAt: ts('updated_at').notNull(),
   },
@@ -350,11 +414,85 @@ export const invoices = sqliteTable(
     subtotal: real('subtotal').notNull().default(0),
     platformFee: real('platform_fee').notNull().default(0),
     supplierAmount: real('supplier_amount').notNull().default(0),
+    /** Decision 2: supply from the platform owner's own bank is the agency's own sale (no platform fee). */
+    agencySale: bool('agency_sale').notNull().default(false),
+    /** Decision 1: the consolidated invoice the host pays and the remittance the supplier receives. */
+    hostInvoiceId: text('host_invoice_id'),
+    remittanceId: text('remittance_id'),
     issuedAt: ts('issued_at'),
     paidAt: ts('paid_at'),
     createdAt: ts('created_at').notNull(),
   },
   (t) => ({ numberIdx: uniqueIndex('invoices_number_idx').on(t.number) }),
+);
+
+/** Decision 1: one invoice per host per period from the platform, covering every supplier. */
+export const hostInvoices = sqliteTable(
+  'host_invoices',
+  {
+    id: text('id').primaryKey(),
+    number: text('number').notNull(),
+    hostOrgId: text('host_org_id').notNull().references(() => organisations.id),
+    periodStart: ts('period_start').notNull(),
+    periodEnd: ts('period_end').notNull(),
+    status: text('status').$type<'ISSUED' | 'PAID' | 'OVERDUE' | 'VOID'>().notNull().default('ISSUED'),
+    currency: text('currency').notNull().default('GBP'),
+    subtotal: real('subtotal').notNull().default(0),
+    credits: real('credits').notNull().default(0),
+    total: real('total').notNull().default(0),
+    dueAt: ts('due_at').notNull(),
+    issuedAt: ts('issued_at').notNull(),
+    paidAt: ts('paid_at'),
+    paymentReference: text('payment_reference'),
+    remindedAt: ts('reminded_at'),
+    createdAt: ts('created_at').notNull(),
+  },
+  (t) => ({ numberIdx: uniqueIndex('host_invoices_number_idx').on(t.number), hostIdx: index('host_invoices_host_idx').on(t.hostOrgId, t.status) }),
+);
+
+/** Decision 1: what the platform pays each supplier per period. */
+export const remittances = sqliteTable(
+  'remittances',
+  {
+    id: text('id').primaryKey(),
+    number: text('number').notNull(),
+    supplierOrgId: text('supplier_org_id').notNull().references(() => organisations.id),
+    periodStart: ts('period_start').notNull(),
+    periodEnd: ts('period_end').notNull(),
+    status: text('status').$type<'ISSUED' | 'PAID' | 'VOID'>().notNull().default('ISSUED'),
+    currency: text('currency').notNull().default('GBP'),
+    amount: real('amount').notNull().default(0),
+    credits: real('credits').notNull().default(0),
+    total: real('total').notNull().default(0),
+    issuedAt: ts('issued_at').notNull(),
+    paidAt: ts('paid_at'),
+    paymentReference: text('payment_reference'),
+    createdAt: ts('created_at').notNull(),
+  },
+  (t) => ({ numberIdx: uniqueIndex('remittances_number_idx').on(t.number), supplierIdx: index('remittances_supplier_idx').on(t.supplierOrgId, t.status) }),
+);
+
+/** Decision 5: a credit against a statement line, raised by the platform after a host query. */
+export const credits = sqliteTable(
+  'credits',
+  {
+    id: text('id').primaryKey(),
+    invoiceId: text('invoice_id').notNull().references(() => invoices.id),
+    timesheetId: text('timesheet_id'),
+    hostOrgId: text('host_org_id').notNull(),
+    supplierOrgId: text('supplier_org_id').notNull(),
+    /** Positive amount reduces what the host owes and what the supplier receives (platform fee pro rata). */
+    amount: real('amount').notNull(),
+    reason: text('reason').notNull(),
+    status: text('status').$type<'REQUESTED' | 'APPROVED' | 'REJECTED' | 'APPLIED'>().notNull().default('REQUESTED'),
+    requestedByUserId: text('requested_by_user_id'),
+    decidedByUserId: text('decided_by_user_id'),
+    appliedToHostInvoiceId: text('applied_to_host_invoice_id'),
+    appliedToRemittanceId: text('applied_to_remittance_id'),
+    createdAt: ts('created_at').notNull(),
+    decidedAt: ts('decided_at'),
+  },
+  (t) => ({ invoiceIdx: index('credits_invoice_idx').on(t.invoiceId) }),
 );
 
 export const ratings = sqliteTable(
@@ -404,6 +542,155 @@ export const auditLog = sqliteTable(
   (t) => ({ entityIdx: index('audit_log_entity_idx').on(t.entityType, t.entityId), timeIdx: index('audit_log_time_idx').on(t.createdAt) }),
 );
 
+/** Invitation and password-reset tokens (stored hashed). */
+export const authTokens = sqliteTable(
+  'auth_tokens',
+  {
+    id: text('id').primaryKey(),
+    userId: text('user_id').notNull().references(() => users.id),
+    kind: text('kind').$type<'INVITE' | 'RESET'>().notNull(),
+    tokenHash: text('token_hash').notNull(),
+    expiresAt: ts('expires_at').notNull(),
+    usedAt: ts('used_at'),
+    createdAt: ts('created_at').notNull(),
+  },
+  (t) => ({ hashIdx: uniqueIndex('auth_tokens_hash_idx').on(t.tokenHash), userIdx: index('auth_tokens_user_idx').on(t.userId) }),
+);
+
+/** Outbox for email and SMS: any provider can drain it (decision 15 deferred the provider). */
+export const outboundMessages = sqliteTable(
+  'outbound_messages',
+  {
+    id: text('id').primaryKey(),
+    channel: text('channel').$type<'EMAIL' | 'SMS'>().notNull(),
+    toAddress: text('to_address').notNull(),
+    subject: text('subject'),
+    body: text('body').notNull(),
+    status: text('status').$type<'PENDING' | 'SENT' | 'FAILED'>().notNull().default('PENDING'),
+    providerReference: text('provider_reference'),
+    error: text('error'),
+    notificationId: text('notification_id'),
+    userId: text('user_id'),
+    orgId: text('org_id'),
+    createdAt: ts('created_at').notNull(),
+    sentAt: ts('sent_at'),
+  },
+  (t) => ({ statusIdx: index('outbound_messages_status_idx').on(t.status, t.createdAt) }),
+);
+
+export const notificationPreferences = sqliteTable('notification_preferences', {
+  userId: text('user_id').primaryKey().references(() => users.id),
+  /** Notification types delivered by email as they happen; everything else goes in the daily digest. */
+  emailImmediate: json<string[]>('email_immediate').notNull().default([]),
+  emailDigest: bool('email_digest').notNull().default(true),
+  smsImmediate: json<string[]>('sms_immediate').notNull().default([]),
+  /** Quiet hours (local), e.g. 22 and 7: non-urgent messages wait. */
+  quietHoursStart: integer('quiet_hours_start'),
+  quietHoursEnd: integer('quiet_hours_end'),
+  maxDistanceKm: real('max_distance_km'),
+  updatedAt: ts('updated_at').notNull(),
+});
+
+/** Decision 14: a host bars a named worker from its shifts (all sites or one site). */
+export const workerBars = sqliteTable(
+  'worker_bars',
+  {
+    id: text('id').primaryKey(),
+    hostOrgId: text('host_org_id').notNull().references(() => organisations.id),
+    workerId: text('worker_id').notNull().references(() => workers.id),
+    siteId: text('site_id'),
+    reason: text('reason').notNull(),
+    createdByUserId: text('created_by_user_id'),
+    createdAt: ts('created_at').notNull(),
+    liftedAt: ts('lifted_at'),
+    liftedByUserId: text('lifted_by_user_id'),
+  },
+  (t) => ({ hostIdx: index('worker_bars_host_idx').on(t.hostOrgId), workerIdx: index('worker_bars_worker_idx').on(t.workerId) }),
+);
+
+/** Decision 14: a host reports a concern about a lent worker to the worker's employer. */
+export const workerReports = sqliteTable(
+  'worker_reports',
+  {
+    id: text('id').primaryKey(),
+    hostOrgId: text('host_org_id').notNull().references(() => organisations.id),
+    supplierOrgId: text('supplier_org_id').notNull().references(() => organisations.id),
+    workerId: text('worker_id').notNull().references(() => workers.id),
+    assignmentId: text('assignment_id'),
+    category: text('category').$type<'SAFEGUARDING' | 'CONDUCT' | 'ATTENDANCE' | 'COMPETENCE' | 'OTHER'>().notNull(),
+    description: text('description').notNull(),
+    status: text('status').$type<'OPEN' | 'ACKNOWLEDGED' | 'CLOSED'>().notNull().default('OPEN'),
+    employerResponse: text('employer_response'),
+    createdByUserId: text('created_by_user_id'),
+    createdAt: ts('created_at').notNull(),
+    acknowledgedAt: ts('acknowledged_at'),
+    closedAt: ts('closed_at'),
+  },
+  (t) => ({ supplierIdx: index('worker_reports_supplier_idx').on(t.supplierOrgId, t.status), workerIdx: index('worker_reports_worker_idx').on(t.workerId) }),
+);
+
+/** Decision 11: training or clearance a host requires beyond the standard mandatory set. */
+export const hostRequirements = sqliteTable(
+  'host_requirements',
+  {
+    id: text('id').primaryKey(),
+    hostOrgId: text('host_org_id').notNull().references(() => organisations.id),
+    name: text('name').notNull(),
+    description: text('description'),
+    /** e.g. a site induction that the host itself records for a worker. */
+    recordedByHost: bool('recorded_by_host').notNull().default(false),
+    createdAt: ts('created_at').notNull(),
+    archivedAt: ts('archived_at'),
+  },
+  (t) => ({ hostIdx: index('host_requirements_host_idx').on(t.hostOrgId) }),
+);
+
+/** A worker holds a host requirement (declared by the employer, or recorded by the host when recordedByHost). */
+export const workerHostRequirements = sqliteTable(
+  'worker_host_requirements',
+  {
+    id: text('id').primaryKey(),
+    workerId: text('worker_id').notNull().references(() => workers.id),
+    requirementId: text('requirement_id').notNull().references(() => hostRequirements.id),
+    documentId: text('document_id'),
+    expiresAt: ts('expires_at'),
+    recordedByUserId: text('recorded_by_user_id'),
+    createdAt: ts('created_at').notNull(),
+  },
+  (t) => ({ pairIdx: uniqueIndex('worker_host_requirements_pair_idx').on(t.workerId, t.requirementId) }),
+);
+
+/** Bulk worker import runs (CSV or spreadsheet). */
+export const importJobs = sqliteTable(
+  'import_jobs',
+  {
+    id: text('id').primaryKey(),
+    orgId: text('org_id').notNull().references(() => organisations.id),
+    createdByUserId: text('created_by_user_id'),
+    fileName: text('file_name'),
+    status: text('status').$type<'PREVIEW' | 'APPLIED' | 'FAILED'>().notNull(),
+    totalRows: integer('total_rows').notNull().default(0),
+    createdCount: integer('created_count').notNull().default(0),
+    updatedCount: integer('updated_count').notNull().default(0),
+    invitedCount: integer('invited_count').notNull().default(0),
+    failedCount: integer('failed_count').notNull().default(0),
+    errors: json<Array<{ row: number; message: string }>>('errors').notNull().default([]),
+    createdAt: ts('created_at').notNull(),
+    appliedAt: ts('applied_at'),
+  },
+  (t) => ({ orgIdx: index('import_jobs_org_idx').on(t.orgId) }),
+);
+
+/** A recurring posting: the pattern that generated a set of shifts. */
+export const shiftSeries = sqliteTable('shift_series', {
+  id: text('id').primaryKey(),
+  hostOrgId: text('host_org_id').notNull().references(() => organisations.id),
+  title: text('title').notNull(),
+  pattern: json<Record<string, unknown>>('pattern').notNull(),
+  createdByUserId: text('created_by_user_id'),
+  createdAt: ts('created_at').notNull(),
+});
+
 export type Organisation = typeof organisations.$inferSelect;
 export type User = typeof users.$inferSelect;
 export type Site = typeof sites.$inferSelect;
@@ -417,3 +704,11 @@ export type Timesheet = typeof timesheets.$inferSelect;
 export type Invoice = typeof invoices.$inferSelect;
 export type Notification = typeof notifications.$inferSelect;
 export type PlatformSettingsRow = typeof platformSettings.$inferSelect;
+export type HostInvoice = typeof hostInvoices.$inferSelect;
+export type Remittance = typeof remittances.$inferSelect;
+export type Credit = typeof credits.$inferSelect;
+export type WorkerBar = typeof workerBars.$inferSelect;
+export type WorkerReport = typeof workerReports.$inferSelect;
+export type HostRequirement = typeof hostRequirements.$inferSelect;
+export type ImportJob = typeof importJobs.$inferSelect;
+export type OutboundMessage = typeof outboundMessages.$inferSelect;

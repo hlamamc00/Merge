@@ -53,6 +53,10 @@ export interface EligibilityContext {
   rules?: Partial<WorkingTimeRules>;
   /** A manager may override the weekly-hours limit when the worker has opted out of the 48h cap. */
   allowHoursOverride?: boolean;
+  /** The host has barred this worker from its shifts (decision 14). */
+  barredByHost?: boolean;
+  /** Host-specific requirements (decision 11) the worker does not hold, by name. */
+  missingHostRequirements?: string[];
 }
 
 export type EligibilityCode =
@@ -73,6 +77,8 @@ export type EligibilityCode =
   | 'INSUFFICIENT_BREAK'
   | 'OUT_OF_TRAVEL_RANGE'
   | 'WORKER_UNAVAILABLE'
+  | 'BARRED_BY_HOST'
+  | 'MISSING_HOST_REQUIREMENT'
   | 'SHIFT_IN_PAST';
 
 export interface EligibilityIssue {
@@ -148,6 +154,12 @@ export function evaluateEligibility(
     blockers.push({ code: 'ACCESS_NOT_OPEN', message: `This shift opens to your organisation at ${ctx.access.opensAt!.toISOString()}` });
   }
 
+  if (ctx.barredByHost) {
+    blockers.push({ code: 'BARRED_BY_HOST', message: 'The host has barred this worker from its shifts' });
+  }
+  if (ctx.missingHostRequirements && ctx.missingHostRequirements.length > 0) {
+    blockers.push({ code: 'MISSING_HOST_REQUIREMENT', message: `Host requires: ${ctx.missingHostRequirements.join(', ')}` });
+  }
   if (worker.unavailableWindows && overlapsAny(shift, worker.unavailableWindows)) {
     blockers.push({ code: 'WORKER_UNAVAILABLE', message: 'Worker has marked this time as unavailable' });
   }

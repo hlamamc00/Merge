@@ -9,6 +9,16 @@ import { LoginPage } from './pages/LoginPage';
 import { NetworkPage } from './pages/NetworkPage';
 import { NewShiftPage } from './pages/NewShiftPage';
 import { NotificationsPage } from './pages/NotificationsPage';
+import { ImportWorkersPage } from './pages/ImportWorkersPage';
+import { AcceptInvitePage } from './pages/AcceptInvitePage';
+import { ForgotPasswordPage } from './pages/ForgotPasswordPage';
+import { ResetPasswordPage } from './pages/ResetPasswordPage';
+import { ChangePasswordPage } from './pages/ChangePasswordPage';
+import { NotificationSettingsPage } from './pages/NotificationSettingsPage';
+import { TrustPage } from './pages/TrustPage';
+import { CompliancePage } from './pages/CompliancePage';
+import { FinancePage } from './pages/FinancePage';
+import { AgencyFinancePage } from './pages/AgencyFinancePage';
 import { PostedShiftsPage } from './pages/PostedShiftsPage';
 import { RegisterPage } from './pages/RegisterPage';
 import { SettingsPage } from './pages/SettingsPage';
@@ -36,6 +46,9 @@ export default function App() {
     <Routes>
       <Route path="/login" element={<LoginPage />} />
       <Route path="/register" element={<RegisterPage />} />
+      <Route path="/invite/:token" element={<AcceptInvitePage />} />
+      <Route path="/forgot-password" element={<ForgotPasswordPage />} />
+      <Route path="/reset-password/:token" element={<ResetPasswordPage />} />
       <Route
         element={
           <RequireAuth>
@@ -51,7 +64,14 @@ export default function App() {
         <Route path="/shifts/:id" element={<ShiftDetailPage />} />
         <Route path="/capacity" element={<RequireAuth manager><CapacityPage /></RequireAuth>} />
         <Route path="/workers" element={<RequireAuth manager><WorkersPage /></RequireAuth>} />
+        <Route path="/workers/import" element={<RequireAuth manager><ImportWorkersPage /></RequireAuth>} />
         <Route path="/workers/:id" element={<WorkerDetailPage />} />
+        <Route path="/compliance" element={<RequireAuth manager><CompliancePage /></RequireAuth>} />
+        <Route path="/trust" element={<RequireAuth manager><TrustPage /></RequireAuth>} />
+        <Route path="/finance" element={<RequireAuth admin><FinancePage /></RequireAuth>} />
+        <Route path="/admin/finance" element={<RequireAuth platform><AgencyFinancePage /></RequireAuth>} />
+        <Route path="/settings/notifications" element={<NotificationSettingsPage />} />
+        <Route path="/change-password" element={<ChangePasswordPage />} />
         <Route path="/timesheets" element={<TimesheetsPage />} />
         <Route path="/statements" element={<RequireAuth admin><StatementsPage /></RequireAuth>} />
         <Route path="/network" element={<RequireAuth manager><NetworkPage /></RequireAuth>} />

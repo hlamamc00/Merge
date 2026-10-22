@@ -29,11 +29,15 @@ export function Layout() {
     { to: '/shifts/supplied', label: isWorker ? 'My shifts' : 'Shifts we cover', icon: '▥', show: true },
     { to: '/capacity', label: 'Capacity flags', icon: '⚑', show: isManager },
     { to: '/workers', label: 'Workers', icon: '☺', show: isManager },
+    { to: '/compliance', label: 'Compliance', icon: '✓', show: isManager },
+    { to: '/trust', label: 'Trust & safety', icon: '⚠', show: isManager },
     { to: '/timesheets', label: 'Timesheets', icon: '◷', show: true },
     { to: '/statements', label: 'Statements', icon: '£', show: isAdmin },
+    { to: '/finance', label: 'Finance', icon: '◇', show: isAdmin },
     { to: '/network', label: 'Network', icon: '⬡', show: isManager },
     { to: '/settings', label: 'Settings', icon: '⚙', show: isManager },
     { to: '/admin', label: 'Platform admin', icon: '◈', show: isPlatformAdmin },
+    { to: '/admin/finance', label: 'Agency finance', icon: '◆', show: isPlatformAdmin },
   ];
 
   const roleLabel = humanise(me.user.role);
