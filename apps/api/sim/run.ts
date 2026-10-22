@@ -17,6 +17,7 @@ import type { NotificationChannel } from '../src/lib/notify.js';
 import { ApiClient, Clock, DAY, GapRegister, HOUR, Rng, fmtDate } from './lib.js';
 import * as ev from './events.js';
 import { renderReport } from './report.js';
+import { deriveGapsFromWeeks } from './derive.js';
 import {
   SIM_START,
   Stats,
@@ -177,6 +178,7 @@ async function main() {
   await ev.probeDaylightSaving(ctx);
   await ev.probeNotificationVolume(ctx, notificationsPerOrgDay, notificationsByType);
   deriveGapsFromData(ctx, sqlite);
+  deriveGapsFromWeeks(gaps, stats.weeks);
 
   const elapsedMin = Math.round(((performance.now() - startedAt) / 60_000) * 10) / 10;
   const result = {

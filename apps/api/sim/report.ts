@@ -1,6 +1,7 @@
 /** Render the simulation result as a Markdown report. */
 import type { Gap } from './lib.js';
 import type { WeekStats } from './scenario.js';
+import { observations } from './derive.js';
 
 interface Result {
   config: { weeks: number; seed: number; start: string; stepHours: number };
@@ -136,6 +137,10 @@ ${monthRows}
 | **Total** | | | | **${totals.posted.toLocaleString()}** | ${sum(r.weeks.map((w) => w.urgentPosted))} | **${pct(totals.filled, totals.places)}** | **${totals.expired}** | ${pct(totals.pr, totals.conf)} / ${pct(totals.ag, totals.conf)} | ${fmtMin(median(r.weeks.flatMap((w) => w.timeToFillMinutes)))} | ${totals.late} / ${totals.noShows} | **${Math.round(totals.hours).toLocaleString()}** | **£${Math.round(totals.charge).toLocaleString()}** | **£${Math.round(totals.fee).toLocaleString()}** |
 
 "Filled via priority" is the share of confirmed bookings whose supplier had priority access from a surplus flag or preferred-partner status; "agency" is the share filled by the agency's own bank. Weeks 17–20 ran with the agency bank released first; compare the agency share in months 4–5 with the rest.
+
+## What the numbers say
+
+${observations(r.weeks, r.providers).map((o) => `- **${o.title}.** ${o.detail}`).join('\n')}
 
 ## Ease of use: how many calls each task needed
 

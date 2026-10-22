@@ -46,7 +46,9 @@ export async function probeWorkerSelfUpload(ctx: SimContext, org: SimOrg): Promi
 /** A worker moves employer. Today the only way is deactivate + recreate + re-enter every document. */
 export async function probeWorkerTransfer(ctx: SimContext, from: SimOrg, to: SimOrg): Promise<void> {
   const { api, gaps, clock, rng } = ctx;
-  const w = from.workers.find((x) => x.active && x.shareable);
+  // A leaver with bookings still ahead of them is the realistic (and revealing) case.
+  const booked = ((await api.get('/api/v1/assignments?scope=outgoing&status=CONFIRMED', from.managerToken)).body as any[]) ?? [];
+  const w = from.workers.find((x) => x.active && x.shareable && booked.some((a) => a.workerId === x.id)) ?? from.workers.find((x) => x.active && x.shareable);
   if (!w) return;
   const before = await api.get(`/api/v1/workers/${w.id}`, from.adminToken);
   const upcoming = (before.body?.upcoming as any[]) ?? [];
@@ -142,8 +144,23 @@ export async function probeInspectorRequest(ctx: SimContext, host: SimOrg): Prom
 
 export async function probeSuspension(ctx: SimContext, org: SimOrg): Promise<void> {
   const { api, gaps, clock, world } = ctx;
-  const openBefore = ((await api.get('/api/v1/shifts?scope=posted', org.managerToken)).body as any[]).filter((s) => s.status === 'OPEN');
-  const outgoing = ((await api.get('/api/v1/assignments?scope=outgoing&status=CONFIRMED', org.managerToken)).body as any[]) ?? [];
+  let openBefore = ((await api.get('/api/v1/shifts?scope=posted', org.managerToken)).body as any[]).filter((s) => s.status === 'OPEN');
+  let outgoing = ((await api.get('/api/v1/assignments?scope=outgoing&status=CONFIRMED', org.managerToken)).body as any[]) ?? [];
+  if (openBefore.length === 0 && outgoing.length === 0) {
+    // The chronic late payer is quiet this week; suspend the busiest small or medium host instead so the effect is visible.
+    const candidates = world.providers().filter((o) => o.id !== org.id && o.size !== 'large');
+    let best: { o: SimOrg; open: any[]; out: any[] } | null = null;
+    for (const o of candidates) {
+      const open = ((await api.get('/api/v1/shifts?scope=posted', o.managerToken)).body as any[]).filter((s) => s.status === 'OPEN');
+      const out = ((await api.get('/api/v1/assignments?scope=outgoing&status=CONFIRMED', o.managerToken)).body as any[]) ?? [];
+      if (!best || open.length + out.length > best.open.length + best.out.length) best = { o, open, out };
+    }
+    if (best && best.open.length + best.out.length > 0) {
+      org = best.o;
+      openBefore = best.open;
+      outgoing = best.out;
+    }
+  }
   const res = await api.task('Suspend an organisation for non-payment', 'agency finance', () => api.patch(`/api/v1/organisations/${org.id}`, world.platformAdminToken, { status: 'SUSPENDED' }));
   api.countTask('Suspend an organisation for non-payment');
   org.status = 'SUSPENDED';
@@ -159,7 +176,7 @@ export async function probeSuspension(ctx: SimContext, org: SimOrg): Promise<voi
     severity: 'high',
     persona: 'agency finance',
     month: monthOf(clock.now),
-    evidence: `${org.name} suspended (${res.status}); its users are locked out (${login.status}) but ${stillVisible.length} of its ${openBefore.length} open shifts stayed visible to ${other.name}, and ${outgoing.length} confirmed booking(s) of its workers at other hosts stayed live with nobody able to manage them.`,
+    evidence: `${org.name} suspended (${res.status}); its users are locked out (${login.status}) but ${stillVisible.length} of its ${openBefore.length} open shifts stayed visible to ${other.name}, and ${outgoing.length} confirmed booking(s) of its workers at other hosts stayed live with nobody able to manage them. Suspension changes only the organisation row (PATCH /organisations/:id); no shift, access or booking is touched.`,
     impact: 'Suppliers keep committing staff to a host that cannot pay; hosts keep relying on workers whose employer is locked out.',
     proposal: 'Suspension should pause posting, hide open shifts, notify counterparties about confirmed bookings and offer a grace window; a separate "credit hold" state for late payment that blocks new postings but keeps existing bookings.',
     decisionNeeded: 'When a host is suspended for non-payment, should its already-confirmed future bookings be cancelled automatically, or honoured and invoiced in arrears?',
