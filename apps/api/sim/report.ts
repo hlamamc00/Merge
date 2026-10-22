@@ -13,6 +13,15 @@ interface Result {
   notificationsByType: Record<string, number>;
   gaps: Gap[];
   log: string[];
+  fixed?: Record<string, string>;
+}
+
+/** Long verifier evidence is cut at a sentence boundary for the report; the full text stays in result.json. */
+function trim(text: string, max = 900): string {
+  if (text.length <= max) return text;
+  const cut = text.slice(0, max);
+  const end = Math.max(cut.lastIndexOf('. '), cut.lastIndexOf('; '));
+  return `${cut.slice(0, end > 300 ? end + 1 : max)} …`;
 }
 
 const sum = (xs: number[]) => xs.reduce((s, n) => s + n, 0);
@@ -97,8 +106,8 @@ export function renderReport(r: Result): string {
           .map(
             (g) =>
               `#### ${g.id} · ${g.title}\n\n` +
-              `**Severity:** ${sevIcon[g.severity]} · **Seen by:** ${g.persona} · **First hit:** month ${g.month + 1}${g.occurrences > 1 ? ` · **Recurred:** ${g.occurrences}×` : ''}\n\n` +
-              `- **What happened:** ${g.evidence}\n` +
+              `**Severity:** ${sevIcon[g.severity]} · **Seen by:** ${g.persona} · **First hit:** month ${g.month + 1}${g.occurrences > 1 ? ` · **Recurred:** ${g.occurrences}×` : ''}${g.status === 'fixed' ? ' · **Status:** ✅ fixed during the exercise' : ''}\n\n` +
+              `- **What happened:** ${trim(g.evidence)}\n` +
               `- **Why it matters:** ${g.impact}\n` +
               `- **Proposed solution:** ${g.proposal}\n` +
               (g.decisionNeeded ? `- **Decision needed:** ${g.decisionNeeded}\n` : ''),
@@ -174,9 +183,15 @@ ${errorRows || '| none | 0 |'}
 
 ## Gap register
 
-${counts.blocker} blockers, ${counts.high} high, ${counts.medium} medium, ${counts.low} low. Each gap records what the simulated person tried, what the platform did, and a proposed solution. Where the solution needs a product decision, it is listed under **Decisions needed** at the end.
+${counts.blocker} blockers, ${counts.high} high, ${counts.medium} medium, ${counts.low} low. Ids starting with a scripted prefix (ONB, DSP, CMP, FIN, …) come from the scripted six-month run; ids starting with P (PH, PR, PW, PA, PF, PC, PM, PS, PT) come from persona walkthroughs of the end state by an HR manager, a small-home rota manager, a care worker on a phone, the agency owner, a host finance clerk, a compliance officer, a registered manager facing inspection, a supplier rota manager and an IT/data-protection lead, each finding checked by an independent verifier against the running system. Each gap records what the simulated person tried, what the platform did, and a proposed solution. Where the solution needs a product decision, it is listed under **Decisions needed** at the end.
 
 ${gapSections}
+
+## Fixed during the exercise
+
+These were defects rather than product gaps, so they were corrected in the codebase as part of this run (the re-run reflects the fixes):
+
+${r.fixed ? Object.entries(r.fixed).map(([id, what]) => `- **${id}** – ${what}`).join('\n') : 'None.'}
 
 ## Decisions needed
 

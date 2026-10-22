@@ -284,6 +284,9 @@ export async function onboardProvider(ctx: SimContext, spec: ProviderSpec): Prom
   );
   if (reg.status !== 201) throw new Error(`register failed: ${JSON.stringify(reg.body)}`);
   api.countTask('Register organisation');
+  const approval = await api.task('Approve a new organisation', 'agency owner', () => api.patch(`/api/v1/organisations/${reg.body.organisation.id}`, world.platformAdminToken, { status: 'ACTIVE' }));
+  api.countTask('Approve a new organisation');
+  if (approval.status !== 200) throw new Error(`approval failed: ${JSON.stringify(approval.body)}`);
   const org: SimOrg = {
     id: reg.body.organisation.id,
     name: spec.name,

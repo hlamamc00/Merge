@@ -180,6 +180,8 @@ export interface Gap {
   /** A product decision the platform owner must make before this can be built. */
   decisionNeeded?: string;
   occurrences: number;
+  /** 'fixed' when the defect was corrected during the exercise (the re-run shows it gone). */
+  status?: 'open' | 'fixed';
 }
 
 export class GapRegister {

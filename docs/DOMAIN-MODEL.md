@@ -16,7 +16,7 @@ Notification, AuditLog, PlatformSettings
 ```
 
 ## Organisation
-An **AGENCY** owns the platform; there is one, created by `POST /auth/bootstrap`. It may have its own workers ("the bank") which take part in the exchange like any other supplier, but at a configurable position in the release order. **PROVIDER** organisations are care companies. Status `PENDING | ACTIVE | SUSPENDED`. `workerSelfServiceAllowed` controls whether its workers may request shifts themselves.
+An **AGENCY** owns the platform; there is one, created by `POST /auth/bootstrap`. It may have its own workers ("the bank") which take part in the exchange like any other supplier, but at a configurable position in the release order. **PROVIDER** organisations are care companies. Status `PENDING` (registered, awaiting platform approval: can set up but not trade) `| ACTIVE | SUSPENDED`. `workerSelfServiceAllowed` controls whether its workers may request shifts themselves.
 
 ## Worker
 Belongs to exactly one employer. `jobRole` with a cover matrix (`ROLE_COVERS`): a worker may cover a shift whose role is in their row (nurse → nurse, team leader, senior carer, care assistant, support worker; care assistant → care assistant, support worker; …). `skills` are capability tags matched against a shift's `requiredSkills`. `shareable` is the employer's consent to lend the worker. `maxHoursPerWeek`, `optedOutOf48h`, `travelRadiusKm`, location. `hourlyPayRate` is private to the employer.

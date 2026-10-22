@@ -64,7 +64,8 @@ authRouter.post(
     ensureSettings(db, at);
     if (db.select({ id: users.id }).from(users).where(eq(users.email, body.admin.email)).get()) throw conflict('An account with that email already exists');
     const orgId = newId('org');
-    db.insert(organisations).values({ id: orgId, ...body.organisation, type: OrgType.PROVIDER, status: 'ACTIVE', createdAt: at, updatedAt: at }).run();
+    // New organisations are vetted by the platform before they can see or post network shifts.
+    db.insert(organisations).values({ id: orgId, ...body.organisation, type: OrgType.PROVIDER, status: 'PENDING', createdAt: at, updatedAt: at }).run();
     const user = await createUser(db, orgId, body.admin, UserRole.ORG_ADMIN, at);
     audit(db, { userId: user.id, orgId }, { action: 'CREATE', entityType: 'organisation', entityId: orgId }, at);
     res.status(201).json({ token: signToken({ sub: user.id, orgId, role: user.role }), user: publicUser(user), organisation: db.select().from(organisations).where(eq(organisations.id, orgId)).get() });
@@ -79,6 +80,10 @@ authRouter.post(
     const user = db.select().from(users).where(eq(users.email, body.email)).get();
     if (!user || !(await verifyPassword(body.password, user.passwordHash))) throw unauthorized('Incorrect email or password');
     if (user.status !== 'ACTIVE') throw unauthorized('Account is not active');
+    if (user.role === UserRole.WORKER) {
+      const linked = user.workerId ? db.select({ status: workers.status }).from(workers).where(eq(workers.id, user.workerId)).get() : undefined;
+      if (!linked || linked.status !== 'ACTIVE') throw unauthorized('Account is not active');
+    }
     const at = now();
     db.update(users).set({ lastLoginAt: at }).where(eq(users.id, user.id)).run();
     audit(db, { userId: user.id, orgId: user.orgId }, { action: 'LOGIN', entityType: 'user', entityId: user.id }, at);

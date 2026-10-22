@@ -37,6 +37,12 @@ export function alertExpiringDocuments(db: Db, notifier: Notifier, now: Date, ho
   let sent = 0;
   const weekAgo = addDays(now, -7);
   for (const { doc, worker } of expiring) {
+    const renewed = db
+      .select({ id: workerDocuments.id })
+      .from(workerDocuments)
+      .where(and(eq(workerDocuments.workerId, doc.workerId), eq(workerDocuments.type, doc.type), isNotNull(workerDocuments.verifiedAt), gt(workerDocuments.expiresAt, doc.expiresAt!)))
+      .get();
+    if (renewed) continue; // superseded by a newer verified document
     const recent = db
       .select({ data: notifications.data, createdAt: notifications.createdAt })
       .from(notifications)

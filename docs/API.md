@@ -8,7 +8,7 @@ Roles: **PA** platform admin (agency), **OA** org admin, **OM** org manager, **W
 | Method | Path | Who | Notes |
 | --- | --- | --- | --- |
 | POST | `/auth/bootstrap` | – | First-run: create the agency and its first platform admin. Once only. |
-| POST | `/auth/register` | – | Create a provider organisation and its admin. Returns `{ token, user, organisation }`. |
+| POST | `/auth/register` | – | Create a provider organisation (status `PENDING`) and its admin. Returns `{ token, user, organisation }`. The platform admin approves it with `PATCH /organisations/:id { status: ACTIVE }`; until then it can set up workers and sites but cannot publish or receive shifts. |
 | POST | `/auth/login` | – | `{ email, password }` → `{ token, user, organisation }` |
 | GET | `/auth/me` | any | `{ user, organisation, worker?, platform }` |
 
@@ -52,7 +52,7 @@ Roles: **PA** platform admin (agency), **OA** org admin, **OM** org manager, **W
 | --- | --- | --- |
 | GET | `/shifts?scope=posted|available|supplied|all&status&jobRole&from&to&includePast` | see below |
 | POST | `/shifts` | managers – shift fields + `publish: boolean` |
-| GET | `/shifts/:id` | host, platform admin, or an organisation in its plan (`isHost`, `canManage`) |
+| GET | `/shifts/:id` | host, platform admin, or an organisation in its plan (`isHost`, `canManage`). Site access notes are included only for the host or an organisation with a confirmed booking; worker logins do not receive `chargeRate`. |
 | PATCH | `/shifts/:id` | host managers (full edit while DRAFT; limited while OPEN) |
 | POST | `/shifts/:id/publish` | host managers |
 | POST | `/shifts/:id/cancel` | host managers – `{ reason? }` |
@@ -94,7 +94,7 @@ Scopes: `posted` = my organisation hosts (managers); `available` = released or s
 | --- | --- | --- |
 | GET | `/invoices?scope=payable|receivable|all` | OA/PA |
 | GET | `/invoices/:id` | OA/PA (party to it) – includes `lines[]` |
-| POST | `/invoices/generate` | OA (own org) / PA – `{ periodStart, periodEnd, hostOrgId?, supplierOrgId? }` |
+| POST | `/invoices/generate` | OA (own org) / PA – `{ periodStart, periodEnd, hostOrgId?, supplierOrgId? }`. Bills every approved, not-yet-invoiced timesheet for shifts starting before `periodEnd`, so late approvals are caught up on the next run. |
 | POST | `/invoices/:id/mark-paid` | OA/PA |
 
 ## Notifications

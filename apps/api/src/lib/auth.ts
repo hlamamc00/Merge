@@ -4,7 +4,7 @@ import type { NextFunction, Request, Response } from 'express';
 import jwt from 'jsonwebtoken';
 import { UserRole } from '@merge/shared';
 import { config } from '../config.js';
-import { organisations, platformSettings, users } from '../db/schema.js';
+import { organisations, platformSettings, users, workers } from '../db/schema.js';
 import { deps } from './context.js';
 import { forbidden, unauthorized } from './errors.js';
 
@@ -42,6 +42,11 @@ export function requireAuth(req: Request, _res: Response, next: NextFunction): v
   const { db } = deps(req);
   const user = db.select().from(users).where(eq(users.id, payload.sub)).get();
   if (!user || user.status !== 'ACTIVE') return next(unauthorized('Account is not active'));
+  if (user.role === UserRole.WORKER) {
+    // A worker login lives and dies with the worker record: deactivating the worker ends their access.
+    const linked = user.workerId ? db.select({ status: workers.status }).from(workers).where(eq(workers.id, user.workerId)).get() : undefined;
+    if (!linked || linked.status !== 'ACTIVE') return next(unauthorized('Account is not active'));
+  }
   const org = db.select().from(organisations).where(eq(organisations.id, user.orgId)).get();
   if (!org) return next(unauthorized('Organisation not found'));
   if (org.status === 'SUSPENDED' && user.role !== UserRole.PLATFORM_ADMIN) return next(forbidden('Your organisation is suspended'));

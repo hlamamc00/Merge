@@ -1,4 +1,4 @@
-import { and, eq, gte, inArray, isNull, lt } from 'drizzle-orm';
+import { and, eq, inArray, isNull, lt } from 'drizzle-orm';
 import { InvoiceStatus, NotificationType, TimesheetStatus, round2 } from '@merge/shared';
 import type { Db } from '../db/client.js';
 import { invoices, organisations, shifts, timesheets, type Invoice } from '../db/schema.js';
@@ -19,7 +19,9 @@ export interface GenerateInvoicesInput {
  * receives `supplierAmount`.
  */
 export function generateInvoices(db: Db, notifier: Notifier, input: GenerateInvoicesInput, now: Date): Invoice[] {
-  const conditions = [eq(timesheets.status, TimesheetStatus.APPROVED), isNull(timesheets.invoiceId), gte(shifts.startsAt, input.periodStart), lt(shifts.startsAt, input.periodEnd)];
+  // Everything approved and not yet invoiced up to the period end is billed, so a timesheet approved after
+  // last month's run is picked up this month rather than falling between two statements.
+  const conditions = [eq(timesheets.status, TimesheetStatus.APPROVED), isNull(timesheets.invoiceId), lt(shifts.startsAt, input.periodEnd)];
   if (input.hostOrgId) conditions.push(eq(timesheets.hostOrgId, input.hostOrgId));
   if (input.supplierOrgId) conditions.push(eq(timesheets.supplierOrgId, input.supplierOrgId));
   const rows = db.select({ ts: timesheets, currency: shifts.currency }).from(timesheets).innerJoin(shifts, eq(shifts.id, timesheets.shiftId)).where(and(...conditions)).all();

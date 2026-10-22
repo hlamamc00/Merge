@@ -8,7 +8,7 @@ import { ADMINS, MANAGERS, assertOrgAccess, hashPassword, isPlatformAdmin, requi
 import { auth, deps } from '../lib/context.js';
 import { conflict, forbidden, h, notFound } from '../lib/errors.js';
 import { newId } from '../lib/ids.js';
-import { parseBody, parseQuery, zPostcode } from '../lib/validate.js';
+import { assertChanges, parseBody, parseQuery, zPostcode } from '../lib/validate.js';
 import { publicUser, zOrganisation } from './auth.js';
 
 export const organisationsRouter = Router();
@@ -134,6 +134,7 @@ organisationsRouter.patch(
     const site = db.select().from(sites).where(and(eq(sites.id, req.params.siteId!), eq(sites.orgId, req.params.id!))).get();
     if (!site) throw notFound('Site');
     const body = parseBody(req, zSite.partial());
+    assertChanges(body);
     db.update(sites).set(body).where(eq(sites.id, site.id)).run();
     auditFromReq(req, db, { action: 'UPDATE', entityType: 'site', entityId: site.id, data: body }, now());
     res.json(db.select().from(sites).where(eq(sites.id, site.id)).get());
@@ -259,6 +260,7 @@ organisationsRouter.patch(
     if (!user) throw notFound('User');
     const body = parseBody(req, z.object({ role: z.enum([UserRole.ORG_ADMIN, UserRole.ORG_MANAGER, UserRole.WORKER]).optional(), status: z.enum(['ACTIVE', 'DISABLED']).optional(), firstName: z.string().trim().min(1).max(60).optional(), lastName: z.string().trim().min(1).max(60).optional() }));
     if (user.id === auth(req).user.id && body.status === 'DISABLED') throw conflict('You cannot disable your own account');
+    assertChanges(body);
     db.update(users).set(body).where(eq(users.id, user.id)).run();
     auditFromReq(req, db, { action: 'UPDATE', entityType: 'user', entityId: user.id, data: body }, now());
     res.json(publicUser(db.select().from(users).where(eq(users.id, user.id)).get()!));

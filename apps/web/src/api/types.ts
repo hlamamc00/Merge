@@ -193,7 +193,8 @@ export interface Shift {
   filledCount: number;
   requiredSkills: Skill[];
   extraRequiredDocuments: DocumentType[];
-  chargeRate: number;
+  /** null for worker logins: they are paid by their employer, not at this rate. */
+  chargeRate: number | null;
   currency: string;
   visibility: ShiftVisibility;
   priorityWindowMinutesOverride: number | null;
@@ -326,7 +327,7 @@ export interface Candidate extends WorkerSummary {
 export interface AssignmentListItem extends Assignment {
   supplierName: string;
   worker: WorkerSummary;
-  shift: { id: string; title: string; jobRole: JobRole; startsAt: string; endsAt: string; chargeRate: number; status: ShiftStatus; hostOrgId: string; siteName: string };
+  shift: { id: string; title: string; jobRole: JobRole; startsAt: string; endsAt: string; chargeRate: number | null; status: ShiftStatus; hostOrgId: string; siteName: string };
 }
 
 export interface Timesheet {
@@ -340,7 +341,8 @@ export interface Timesheet {
   clockOutAt: string | null;
   breakMinutes: number;
   paidHours: number;
-  chargeRate: number;
+  /** null for worker logins: they are paid by their employer, not at this rate. */
+  chargeRate: number | null;
   platformFeePct: number;
   hostCost: number;
   platformFee: number;

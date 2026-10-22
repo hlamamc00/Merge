@@ -4,11 +4,11 @@ import { z } from 'zod';
 import { DocumentType, JobRole, Skill, UserRole, WorkerStatus, complianceSummary } from '@merge/shared';
 import { ratings, shiftAssignments, shifts, users, workerDocuments, workerUnavailability, workers } from '../db/schema.js';
 import { auditFromReq } from '../lib/audit.js';
-import { MANAGERS, assertOrgAccess, hashPassword, isPlatformAdmin, requireAuth, requireRole } from '../lib/auth.js';
+import { MANAGERS, assertOrgAccess, hashPassword, isManager, isPlatformAdmin, requireAuth, requireRole } from '../lib/auth.js';
 import { auth, deps } from '../lib/context.js';
 import { conflict, forbidden, h, notFound } from '../lib/errors.js';
 import { newId } from '../lib/ids.js';
-import { parseBody, parseQuery, zDate, zOptionalDate, zPostcode } from '../lib/validate.js';
+import { assertChanges, parseBody, parseQuery, zDate, zOptionalDate, zPostcode } from '../lib/validate.js';
 
 export const workersRouter = Router();
 workersRouter.use(requireAuth);
@@ -91,7 +91,7 @@ function loadWorker(req: Parameters<typeof deps>[0], id: string) {
   const w = db.select().from(workers).where(eq(workers.id, id)).get();
   if (!w) throw notFound('Worker');
   const { user } = auth(req);
-  const own = w.orgId === user.orgId || isPlatformAdmin(req);
+  const own = (isManager(req) && w.orgId === user.orgId) || isPlatformAdmin(req); // workers never get organisation-wide access
   const self = user.workerId === w.id && user.orgId === w.orgId;
   if (!own && !self) throw forbidden('That worker belongs to another organisation');
   return { worker: w, own, self };
@@ -197,6 +197,7 @@ workersRouter.patch(
     const { verified, ...data } = body;
     const at = now();
     const verification = verified === undefined ? {} : verified ? { verifiedAt: at, verifiedByUserId: auth(req).user.id } : { verifiedAt: null, verifiedByUserId: null };
+    assertChanges({ ...data, ...verification });
     db.update(workerDocuments).set({ ...data, ...verification }).where(eq(workerDocuments.id, doc.id)).run();
     auditFromReq(req, db, { action: verified ? 'APPROVE' : 'UPDATE', entityType: 'worker_document', entityId: doc.id, data: body }, at);
     res.json(db.select().from(workerDocuments).where(eq(workerDocuments.id, doc.id)).get());

@@ -41,7 +41,7 @@ export function ShiftDetailPage() {
             items={[
               { label: 'When', value: fmtShiftWindow(s.startsAt, s.endsAt, s.breakMinutes) },
               { label: 'Break', value: `${s.breakMinutes} min unpaid` },
-              { label: 'Charge rate', value: `${fmtMoney(s.chargeRate)}/h · ${fmtMoney((s.paidHours ?? 0) * s.chargeRate)} per worker` },
+              { label: s.chargeRate == null ? 'Pay' : 'Charge rate', value: s.chargeRate == null ? 'Set by your employer' : `${fmtMoney(s.chargeRate)}/h · ${fmtMoney((s.paidHours ?? 0) * s.chargeRate)} per worker` },
               { label: 'Places', value: `${s.filledCount} of ${s.headcount} filled` },
               { label: 'Visibility', value: humanise(s.visibility) },
               { label: 'Published', value: s.publishedAt ? fmtDateTime(s.publishedAt) : 'Draft' },
@@ -116,7 +116,7 @@ function HostActions({ shift }: { shift: ShiftDetail }) {
   const [edit, setEdit] = useState(false);
   const [cancel, setCancel] = useState(false);
   const [reason, setReason] = useState('');
-  const [form, setForm] = useState({ chargeRate: String(shift.chargeRate), headcount: String(shift.headcount), title: shift.title, autoConfirm: shift.autoConfirm });
+  const [form, setForm] = useState({ chargeRate: String(shift.chargeRate ?? ''), headcount: String(shift.headcount), title: shift.title, autoConfirm: shift.autoConfirm });
   const publish = useAction(() => api.post(`/shifts/${shift.id}/publish`));
   const update = useAction(() => api.patch(`/shifts/${shift.id}`, { chargeRate: Number(form.chargeRate), headcount: Number(form.headcount), title: form.title, autoConfirm: form.autoConfirm }), () => setEdit(false));
   const doCancel = useAction(() => api.post(`/shifts/${shift.id}/cancel`, { reason: reason || null }), () => { setCancel(false); navigate('/shifts/posted'); });

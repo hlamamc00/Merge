@@ -43,7 +43,7 @@ export function cancelShift(db: Db, notifier: Notifier, shift: Shift, reason: st
     });
   }
   db.update(shifts).set({ status: ShiftStatus.CANCELLED, cancelledAt: now, cancellationReason: reason, updatedAt: now }).where(eq(shifts.id, shift.id)).run();
-  db.delete(shiftAccess).where(eq(shiftAccess.shiftId, shift.id)).run();
+  // The release plan is kept as the record of who was offered the shift and when.
   return db.select().from(shifts).where(eq(shifts.id, shift.id)).get()!;
 }
 
@@ -65,7 +65,7 @@ export function progressShifts(db: Db, notifier: Notifier, now: Date): { started
       notifier.send({ orgId: s.hostOrgId, type: NotificationType.SHIFT_UNFILLED, title: `Shift went unfilled: ${s.title}`, body: `No worker was confirmed before the shift started at ${s.startsAt.toISOString()}.`, data: { shiftId: s.id } });
       expired++;
     }
-    db.delete(shiftAccess).where(eq(shiftAccess.shiftId, s.id)).run();
+    // Access rows are kept: listings filter on shift status, and the plan is the audit trail of what was done.
   }
 
   const dueToEnd = db.select().from(shifts).where(and(eq(shifts.status, ShiftStatus.IN_PROGRESS), lte(shifts.endsAt, now))).all();

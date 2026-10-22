@@ -140,8 +140,8 @@ shiftsRouter.get(
         .all();
       return res.json(
         rows.map(({ assignment, shift, site, hostName, worker }) => ({
-          ...guestShift(shift),
-          site: siteForGuest(site),
+          ...forViewer(guestShift(shift), user.role),
+          site: siteForGuest(site, assignment.status === 'CONFIRMED' || assignment.status === 'COMPLETED'),
           hostName,
           assignment,
           worker: { id: worker.id, firstName: worker.firstName, lastName: worker.lastName, jobRole: worker.jobRole },
@@ -170,7 +170,7 @@ shiftsRouter.get(
       rows
         .filter(({ shift }) => !myWorker || roleCanCover(myWorker.jobRole, shift.jobRole))
         .map(({ shift, site, hostName, access }) => ({
-          ...guestShift(shift),
+          ...forViewer(guestShift(shift), user.role),
           site: siteForGuest(site),
           hostName,
           access: { tier: access.tier, opensAt: access.opensAt, open: access.opensAt.getTime() <= at.getTime(), reason: liveAccessReason(access.reason, access.matchedFlagId ? flagsById.get(access.matchedFlagId) : null) },
@@ -193,6 +193,7 @@ shiftsRouter.post(
     if (!site) throw notFound('Site');
     const at = now();
     if (body.startsAt.getTime() <= at.getTime()) throw unprocessable('Shift must start in the future');
+    if (body.publish && org.status !== 'ACTIVE' && !isPlatformAdmin(req)) throw forbidden('Your organisation is awaiting approval by the platform; you can save drafts but not publish');
     const { publish, hostOrgId: _h, ...data } = body;
     const id = newId('shf');
     db.insert(shifts).values({ id, hostOrgId, ...data, currency: settings.currency, status: ShiftStatus.DRAFT, createdByUserId: user.id, createdAt: at, updatedAt: at }).run();
@@ -213,8 +214,14 @@ function loadShift(req: Parameters<typeof deps>[0], id: string) {
   return row;
 }
 
-function siteForGuest(site: typeof sites.$inferSelect) {
-  return { id: site.id, name: site.name, serviceType: site.serviceType, addressLine1: site.addressLine1, city: site.city, postcode: site.postcode, lat: site.lat, lng: site.lng, accessNotes: site.accessNotes };
+/** What other organisations see of a site. Access notes (door codes, who to report to) only once a booking is confirmed. */
+function siteForGuest(site: typeof sites.$inferSelect, confirmed = false) {
+  return { id: site.id, name: site.name, serviceType: site.serviceType, addressLine1: site.addressLine1, city: site.city, postcode: site.postcode, lat: site.lat, lng: site.lng, accessNotes: confirmed ? site.accessNotes : null };
+}
+
+/** A worker login is paid by their employer, not at the inter-organisation charge rate, so that figure is withheld. */
+function forViewer<T extends { chargeRate: number }>(s: T, role: UserRole): T | (Omit<T, 'chargeRate'> & { chargeRate: null }) {
+  return role === UserRole.WORKER ? { ...s, chargeRate: null } : s;
 }
 
 shiftsRouter.get(
@@ -228,8 +235,9 @@ shiftsRouter.get(
     const isHost = shift.hostOrgId === org.id;
     const canManage = isHost || isPlatformAdmin(req);
     const access = accessFor(db, shift.id, org.id, at);
-    const hasAssignment = db.select({ id: shiftAssignments.id }).from(shiftAssignments).where(and(eq(shiftAssignments.shiftId, shift.id), eq(shiftAssignments.supplierOrgId, org.id))).get();
-    if (!canManage && !access.opensAt && !hasAssignment) throw forbidden('This shift has not been released to your organisation');
+    const hasAssignment = db.select({ id: shiftAssignments.id, status: shiftAssignments.status }).from(shiftAssignments).where(and(eq(shiftAssignments.shiftId, shift.id), eq(shiftAssignments.supplierOrgId, org.id))).all();
+    if (!canManage && !access.opensAt && hasAssignment.length === 0) throw forbidden('This shift has not been released to your organisation');
+    const hasConfirmed = hasAssignment.some((a) => a.status === 'CONFIRMED' || a.status === 'COMPLETED');
 
     const assignmentRows = db
       .select({ assignment: shiftAssignments, worker: workers, supplierName: organisations.name })
@@ -246,8 +254,8 @@ shiftsRouter.get(
     }));
 
     res.json({
-      ...(canManage ? publicShift(shift) : guestShift(shift)),
-      site: canManage ? site : siteForGuest(site),
+      ...(canManage ? publicShift(shift) : forViewer(guestShift(shift), user.role)),
+      site: canManage ? site : siteForGuest(site, hasConfirmed),
       hostName,
       isHost,
       canManage,
@@ -302,6 +310,7 @@ shiftsRouter.post(
     const { shift, site } = loadShift(req, req.params.id!);
     assertOrgAccess(req, shift.hostOrgId);
     if (shift.status !== ShiftStatus.DRAFT) throw conflict('Only draft shifts can be published');
+    if (auth(req).org.status !== 'ACTIVE' && !isPlatformAdmin(req)) throw forbidden('Your organisation is awaiting approval by the platform; you can save drafts but not publish');
     const at = now();
     if (shift.startsAt.getTime() <= at.getTime()) throw unprocessable('Shift must start in the future');
     const published = publishShift(db, notifier, settings, shift, site, at);

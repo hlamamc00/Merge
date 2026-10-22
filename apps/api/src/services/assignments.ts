@@ -1,7 +1,7 @@
-import { and, eq, inArray } from 'drizzle-orm';
+import { and, eq, inArray, lte } from 'drizzle-orm';
 import { AssignmentStatus, JOB_ROLE_LABELS, NotificationType, ShiftStatus, hoursBetween, shiftPaidHours } from '@merge/shared';
 import type { Db } from '../db/client.js';
-import { organisations, shiftAssignments, shifts, workers, type PlatformSettingsRow, type Shift, type ShiftAssignment, type Site, type Worker } from '../db/schema.js';
+import { organisations, shiftAccess, shiftAssignments, shifts, workers, type PlatformSettingsRow, type Shift, type ShiftAssignment, type Site, type Worker } from '../db/schema.js';
 import { conflict, unprocessable } from '../lib/errors.js';
 import { newId } from '../lib/ids.js';
 import type { Notifier } from '../lib/notify.js';
@@ -226,6 +226,10 @@ export function cancelAssignment(db: Db, notifier: Notifier, settings: PlatformS
     .run();
   const filledCount = Math.max(0, shift.filledCount - 1);
   db.update(shifts).set({ filledCount, status: shift.status === ShiftStatus.FILLED ? ShiftStatus.OPEN : shift.status, updatedAt: now }).where(eq(shifts.id, shift.id)).run();
+  if (shift.status === ShiftStatus.FILLED) {
+    // The shift is open again: re-announce it to everyone whose stage has already opened (the scheduler sends the notices).
+    db.update(shiftAccess).set({ notifiedAt: null }).where(and(eq(shiftAccess.shiftId, shift.id), lte(shiftAccess.opensAt, now))).run();
+  }
   releaseHoursFromFlag(db, assignment.matchedFlagId, shiftPaidHours(shift.startsAt, shift.endsAt, shift.breakMinutes), now);
   closeTimesheetForEndedBooking(db, assignment.id, 'Booking cancelled', now);
 

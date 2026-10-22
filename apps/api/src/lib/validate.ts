@@ -1,5 +1,6 @@
 import type { Request } from 'express';
 import { z } from 'zod';
+import { HttpError } from './errors.js';
 
 export function parseBody<T extends z.ZodTypeAny>(req: Request, schema: T): z.infer<T> {
   return schema.parse(req.body ?? {});
@@ -22,5 +23,10 @@ export const zQueryBool = z
   .union([z.boolean(), z.enum(['true', 'false', '1', '0'])])
   .optional()
   .transform((v) => v === true || v === 'true' || v === '1');
+
+/** PATCH bodies that carry no recognised field would otherwise make the update builder throw. */
+export function assertChanges(body: Record<string, unknown>): void {
+  if (Object.keys(body).length === 0) throw new HttpError(400, 'No recognised fields to update');
+}
 
 export const zPostcode = z.string().trim().min(2).max(10).transform((s) => s.toUpperCase());

@@ -24,7 +24,7 @@ export function ShiftCard({ shift, compact }: { shift: AvailableShift; compact?:
           </div>
         </div>
         <div className="text-right">
-          <div className="text-lg font-semibold text-slate-900">{fmtMoney(shift.chargeRate)}<span className="text-xs font-normal text-slate-500">/h</span></div>
+          <div className="text-lg font-semibold text-slate-900">{shift.chargeRate == null ? <span className="text-sm font-medium text-slate-500">Pay via your employer</span> : <>{fmtMoney(shift.chargeRate)}<span className="text-xs font-normal text-slate-500">/h</span></>}</div>
           <div className="text-xs text-slate-500">{shift.placesLeft} place{shift.placesLeft === 1 ? '' : 's'} left</div>
         </div>
       </div>
