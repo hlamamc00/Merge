@@ -106,3 +106,5 @@ Full details, including the agency-position settings and worked examples, are in
 - [docs/DISPATCH-AND-PRIORITY.md](docs/DISPATCH-AND-PRIORITY.md) – the capacity-flag priority system
 - [docs/API.md](docs/API.md) – REST endpoints
 - [docs/FEATURE-ROADMAP.md](docs/FEATURE-ROADMAP.md) – suggested features to make the platform comprehensive
+- [docs/SIMULATION-REPORT.md](docs/SIMULATION-REPORT.md) – six-month market-entry simulation: metrics and gap register
+- [docs/DECISIONS.md](docs/DECISIONS.md) – product decisions taken in response to the simulation
