@@ -1,5 +1,5 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { useNavigate } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { api } from '../api/client';
 import { notificationLink, useNotifications } from '../components/Layout';
 import { Button, Card, EmptyState, Loading, PageHeader, cx } from '../components/ui';
@@ -13,7 +13,11 @@ export function NotificationsPage() {
   const markAll = useMutation({ mutationFn: () => api.post('/notifications/read-all'), onSuccess: () => qc.invalidateQueries({ queryKey: ['notifications'] }) });
   return (
     <div className="space-y-5">
-      <PageHeader title="Notifications" description={`${q.data?.unread ?? 0} unread`} actions={<Button variant="secondary" onClick={() => markAll.mutate()} loading={markAll.isPending}>Mark all read</Button>} />
+      <PageHeader
+        title="Notifications"
+        description={<span>{q.data?.unread ?? 0} unread · <Link to="/settings/notifications" className="font-medium text-brand-700 hover:underline">Choose what reaches your email or phone</Link></span>}
+        actions={<Button variant="secondary" onClick={() => markAll.mutate()} loading={markAll.isPending}>Mark all read</Button>}
+      />
       <Card>
         {q.isLoading ? <Loading /> : (q.data?.notifications ?? []).length === 0 ? <EmptyState title="No notifications yet" /> : (
           <ul className="divide-y divide-slate-100">

@@ -1,6 +1,7 @@
 import type { NotificationType } from '@merge/shared';
 import type { Db } from '../db/client.js';
 import { notifications } from '../db/schema.js';
+import { deliverNotification } from '../services/delivery.js';
 import { newId } from './ids.js';
 
 export interface OutboundNotification {
@@ -35,6 +36,8 @@ export class Notifier {
       .insert(notifications)
       .values({ id, orgId: n.orgId, userId: n.userId ?? null, type: n.type, title: n.title, body: n.body, data: n.data ?? null, readAt: null, createdAt })
       .run();
+    // Email/SMS delivery according to each recipient's preferences (services/delivery.ts); never throws.
+    deliverNotification(this.db, { id, orgId: n.orgId, userId: n.userId ?? null, type: n.type, title: n.title, body: n.body, data: n.data ?? null, createdAt });
     for (const ch of this.channels) {
       Promise.resolve(ch.send({ ...n, id, createdAt })).catch((err) => console.error(`[notify:${ch.name}]`, err));
     }
