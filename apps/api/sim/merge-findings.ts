@@ -40,6 +40,12 @@ const FIXED: Record<string, string> = {
   'PW-03': 'Worker logins no longer see the inter-organisation charge rate as if it were their pay.',
   'WF-02': 'Covered by the deactivation fix for logins; cancelling the future bookings of a leaver remains an open proposal.',
 };
+/**
+ * Persona verifiers attached a decision to every finding. Only those that materially change what gets built
+ * are kept as questions for the platform owner; for the rest the proposal takes a sensible default.
+ */
+const KEEP_DECISION = new Set(['PH-01', 'PH-02', 'PH-03', 'PR-02', 'PR-04', 'PW-03', 'PA-01', 'PA-04', 'PF-03', 'PC-01', 'PM-06', 'PS-01', 'PT-01', 'PT-02', 'PT-03', 'PT-06']);
+for (const f of findings) if (!KEEP_DECISION.has(f.id)) delete f.decisionNeeded;
 const existing = new Set((result.gaps as Gap[]).map((g) => g.id));
 for (const g of result.gaps as Gap[]) {
   if (extensions[g.id]) g.evidence += extensions[g.id];

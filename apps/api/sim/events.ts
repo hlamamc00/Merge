@@ -46,9 +46,18 @@ export async function probeWorkerSelfUpload(ctx: SimContext, org: SimOrg): Promi
 /** A worker moves employer. Today the only way is deactivate + recreate + re-enter every document. */
 export async function probeWorkerTransfer(ctx: SimContext, from: SimOrg, to: SimOrg): Promise<void> {
   const { api, gaps, clock, rng } = ctx;
-  // A leaver with bookings still ahead of them is the realistic (and revealing) case.
-  const booked = ((await api.get('/api/v1/assignments?scope=outgoing&status=CONFIRMED', from.managerToken)).body as any[]) ?? [];
-  const w = from.workers.find((x) => x.active && x.shareable && booked.some((a) => a.workerId === x.id)) ?? from.workers.find((x) => x.active && x.shareable);
+  // A leaver with bookings still ahead of them is the realistic (and revealing) case; look across the network for one.
+  let w: SimWorker | undefined;
+  for (const candidate of [from, ...ctx.world.providers().filter((o) => o.id !== from.id && o.id !== to.id)]) {
+    const booked = ((await api.get('/api/v1/assignments?scope=outgoing&status=CONFIRMED', candidate.managerToken)).body as any[]) ?? [];
+    const found = candidate.workers.find((x) => x.active && x.shareable && booked.some((a) => a.workerId === x.id));
+    if (found) {
+      w = found;
+      from = candidate;
+      break;
+    }
+  }
+  w ??= from.workers.find((x) => x.active && x.shareable);
   if (!w) return;
   const before = await api.get(`/api/v1/workers/${w.id}`, from.adminToken);
   const upcoming = (before.body?.upcoming as any[]) ?? [];
