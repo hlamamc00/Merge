@@ -8,9 +8,10 @@ import { monthOf, type SimContext, type SimOrg, type SimWorker } from './scenari
 
 export async function probeMissingEndpoints(ctx: SimContext, org: SimOrg): Promise<void> {
   const { api, gaps, clock } = ctx;
-  const importRes = await api.task('Try to bulk-import workers', 'HR manager', () => api.post('/api/v1/workers/import', org.adminToken, { rows: [] }));
-  const resetRes = await api.task('Try to reset a password', 'care worker', () => api.post('/api/v1/auth/forgot-password', null, { email: org.adminEmail }));
-  const inviteRes = await api.task('Try to invite a user by email', 'org admin', () => api.post(`/api/v1/organisations/${org.id}/invitations`, org.adminToken, { email: 'new.manager@example.com', role: 'ORG_MANAGER' }));
+  const importRes = await api.task('Try to bulk-import workers', 'HR manager', () => api.get('/api/v1/onboarding/import/template.csv', org.adminToken));
+  const resetRes = await api.task('Try to reset a password', 'care worker', () => api.post('/api/v1/onboarding/forgot-password', null, { email: org.adminEmail }));
+  const inviteRes = await api.task('Try to invite a user by email', 'org admin', () => api.post('/api/v1/onboarding/invitations', org.adminToken, { email: 'new.manager@example.com', role: 'ORG_MANAGER', firstName: 'New', lastName: 'Manager' }));
+  if (resetRes.status !== 404 && inviteRes.status !== 404 && importRes.status !== 404) return; // all present
   gaps.record({
     id: 'ONB-04',
     title: 'No password reset or email invitations',
@@ -29,6 +30,7 @@ export async function probeWorkerSelfUpload(ctx: SimContext, org: SimOrg): Promi
   const w = org.workers.find((x) => x.token);
   if (!w) return;
   const res = await api.task('Worker uploads own certificate', 'care worker (phone)', () => api.post(`/api/v1/workers/${w.id}/documents`, w.token, { type: 'MOVING_AND_HANDLING_TRAINING', reference: 'MH-2027', expiresAt: iso(clock.plusDays(365)) }));
+  if (res.status === 201) return; // workers can add their own documents now
   gaps.record({
     id: 'CMP-03',
     title: 'Workers cannot upload their own documents or see their compliance status clearly',

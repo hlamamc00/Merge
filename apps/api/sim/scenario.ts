@@ -87,6 +87,8 @@ export interface SimContext {
   log: (msg: string) => void;
   world: World;
   stats: Stats;
+  /** The simulated person reads their email: latest outbound message body sent to this address, if any. */
+  mailbox: (email: string) => string | null;
 }
 
 export interface WeekStats {
@@ -119,6 +121,10 @@ export interface WeekStats {
   workersBlockedByCompliance: number;
   notificationsSent: number;
   apiErrors: Record<string, number>;
+  escalatedShifts: number;
+  reportsRaised: number;
+  barsCreated: number;
+  emailsSent: number;
 }
 
 export class Stats {
@@ -157,6 +163,10 @@ export class Stats {
       workersBlockedByCompliance: 0,
       notificationsSent: 0,
       apiErrors: {},
+      escalatedShifts: 0,
+      reportsRaised: 0,
+      barsCreated: 0,
+      emailsSent: 0,
     };
     this.weeks.push(this.current);
   }
@@ -173,6 +183,10 @@ export class World {
   orgs: SimOrg[] = [];
   platformAdminToken = '';
   agency!: SimOrg;
+  /** Platform floor charge rate (decision 3), refreshed weekly; 0 when the endpoint does not exist. */
+  floorRate = 0;
+  /** Which of the phase-1 endpoints exist on the API under test (detected on first use). */
+  features: Record<string, boolean> = {};
   /** shiftId → details we need later without refetching */
   shifts = new Map<string, { hostOrgId: string; publishedAt: Date; startsAt: Date; endsAt: Date; headcount: number; group: RoleGroup; urgent: boolean }>();
   providers(): SimOrg[] {
@@ -219,6 +233,8 @@ export interface ProviderSpec {
   payLagDays?: number;
   /** Baseline balance per role group in shifts/week (negative = short-staffed). */
   balance: Record<RoleGroup, number>;
+  /** Decision 6: this host chooses automatic escalation of unfilled shifts. */
+  autoEscalate?: boolean;
 }
 
 // ----------------------------------------------------------------------------------------------
@@ -265,7 +281,8 @@ export async function bootstrapAgency(ctx: SimContext, bankSize: number): Promis
   };
   world.agency = agency;
   world.orgs.push(agency);
-  await api.task('Platform settings', 'agency owner', () => api.patch('/api/v1/admin/settings', world.platformAdminToken, { platformFeePct: 8, priorityWindowMinutes: 120, agencyWindowMinutes: 60, agencyPosition: 'AFTER_PRIORITY' }));
+  await api.task('Platform settings', 'agency owner', () => api.patch('/api/v1/admin/settings', world.platformAdminToken, { platformFeePct: 8, priorityWindowMinutes: 120, agencyWindowMinutes: 60, agencyPosition: 'AFTER_PRIORITY', twoFactorRequiredForManagers: false }));
+  await refreshFloorRate(ctx);
   await addWorkers(ctx, agency, bankSize, { loginShare: 0.8 });
   ctx.log(`${fmtDate(clock.now)} agency ready with a bank of ${bankSize}`);
 }
@@ -278,13 +295,17 @@ export async function onboardProvider(ctx: SimContext, spec: ProviderSpec): Prom
   const callsBefore = api.calls.length;
   const reg = await api.task('Register organisation', 'org admin', () =>
     api.post('/api/v1/auth/register', null, {
-      organisation: { name: spec.name, postcode: `${area.outward} 1AA`, lat: area.lat, lng: area.lng, serviceTypes: [spec.serviceType], defaultChargeRate: BASE_RATE.CARE, workerSelfServiceAllowed: !!spec.selfService, email },
+      organisation: { name: spec.name, postcode: `${area.outward} 1AA`, lat: area.lat, lng: area.lng, serviceTypes: [spec.serviceType], defaultChargeRate: BASE_RATE.CARE, workerSelfServiceAllowed: !!spec.selfService, email, cqcRegistrationNumber: `1-${rng.int(100000000, 999999999)}` },
       admin: { email, password: 'Simulation-Pass-1', firstName: 'Admin', lastName: spec.name.split(' ')[0]! },
+      cqcRegistrationNumber: `1-${rng.int(100000000, 999999999)}`,
+      mouAccepted: true,
     }),
   );
   if (reg.status !== 201) throw new Error(`register failed: ${JSON.stringify(reg.body)}`);
   api.countTask('Register organisation');
-  const approval = await api.task('Approve a new organisation', 'agency owner', () => api.patch(`/api/v1/organisations/${reg.body.organisation.id}`, world.platformAdminToken, { status: 'ACTIVE' }));
+  // Decision 12: the agency checks CQC registration and MOU acceptance, then approves.
+  let approval = await api.task('Approve a new organisation', 'agency owner', () => api.post(`/api/v1/organisations/${reg.body.organisation.id}/approve`, world.platformAdminToken, {}));
+  if (approval.status === 404) approval = await api.task('Approve a new organisation', 'agency owner', () => api.patch(`/api/v1/organisations/${reg.body.organisation.id}`, world.platformAdminToken, { status: 'ACTIVE' }));
   api.countTask('Approve a new organisation');
   if (approval.status !== 200) throw new Error(`approval failed: ${JSON.stringify(approval.body)}`);
   const org: SimOrg = {
@@ -335,12 +356,18 @@ export async function onboardProvider(ctx: SimContext, spec: ProviderSpec): Prom
     org.sites.push({ id: site.body.id, name: site.body.name, lat: pc.lat, lng: pc.lng, postcode: pc.postcode, serviceType: spec.serviceType });
   }
 
-  await addWorkers(ctx, org, spec.staff, { loginShare: spec.selfService ? 0.5 : 0.15, nurses: spec.serviceType === 'NURSING' });
+  if (spec.autoEscalate) {
+    await api.task('Choose automatic escalation', 'org admin', () => api.patch(`/api/v1/organisations/${org.id}`, org.adminToken, { escalationMode: 'AUTO', escalationCeilingPct: 20 }));
+    api.countTask('Choose automatic escalation');
+  }
+
+  const imported = spec.staff >= 40 ? await importWorkers(ctx, org, spec.staff, { loginShare: spec.selfService ? 0.5 : 0.15, nurses: spec.serviceType === 'NURSING' }) : false;
+  if (!imported) await addWorkers(ctx, org, spec.staff, { loginShare: spec.selfService ? 0.5 : 0.15, nurses: spec.serviceType === 'NURSING' });
 
   const elapsedMin = round1((performance.now() - started) / 60_000);
   const calls = api.calls.length - callsBefore;
-  ctx.log(`${fmtDate(clock.now)} onboarded ${spec.name} (${spec.staff} staff, ${spec.sites} site(s)): ${calls} API calls, ${elapsedMin} min of machine time`);
-  if (spec.staff >= 40) {
+  ctx.log(`${fmtDate(clock.now)} onboarded ${spec.name} (${spec.staff} staff, ${spec.sites} site(s)) ${imported ? 'by spreadsheet import' : 'one worker at a time'}: ${calls} API calls, ${elapsedMin} min of machine time`);
+  if (spec.staff >= 40 && !imported) {
     gaps.record({
       id: 'ONB-01',
       title: 'No bulk import: every worker and every document is added one at a time',
@@ -434,7 +461,7 @@ async function addWorkers(ctx: SimContext, org: SimOrg, count: number, opts: { l
       }
     }
   }
-  if (count >= 10) {
+  if (count >= 10 && !ctx.world.features.invitations) {
     gaps.record({
       id: 'ONB-02',
       title: 'Worker logins are created by hand with a password the manager must pass on',
@@ -526,6 +553,7 @@ function makePost(ctx: SimContext, org: SimOrg, group: RoleGroup, week: number):
   const weekend = startsAt.getUTCDay() === 0 || startsAt.getUTCDay() === 6;
   let rate = BASE_RATE[group] * (pattern.name === 'Night' ? 1.12 : 1) * (weekend ? 1.1 : 1) * (urgent ? 1.2 : 1);
   rate = Math.round(rate * 4) / 4;
+  if (ctx.world.floorRate > 0 && rate < ctx.world.floorRate) rate = Math.ceil(ctx.world.floorRate * 20) / 20; // decision 3: never below the floor
   const jobRole = rng.pick(ROLE_FOR_GROUP[group]);
   const site = rng.pick(org.sites);
   const skills: Skill[] = ['MOVING_AND_HANDLING'];
@@ -674,6 +702,31 @@ export async function hostCheck(ctx: SimContext, org: SimOrg): Promise<void> {
   api.countTask('Review incoming requests');
   if (incoming.status !== 200) return;
   const requests = incoming.body as any[];
+  if (requests.length >= 5 && world.features.bulkConfirm !== false) {
+    // First come, first served per shift, confirmed in one action.
+    const chosen: string[] = [];
+    const seen = new Map<string, number>();
+    for (const r of [...requests].sort((a, b) => new Date(a.requestedAt).getTime() - new Date(b.requestedAt).getTime())) {
+      const cap = world.shifts.get(r.shiftId)?.headcount ?? 1;
+      const n = seen.get(r.shiftId) ?? 0;
+      if (n < cap && rng.chance(0.92)) {
+        chosen.push(r.id);
+        seen.set(r.shiftId, n + 1);
+      }
+    }
+    const bulk = await api.task('Confirm requests in bulk', 'rota manager', () => api.post('/api/v1/assignments/bulk', org.managerToken, { ids: chosen, action: 'confirm' }));
+    if (bulk.status === 404) world.features.bulkConfirm = false;
+    else {
+      api.countTask('Confirm requests in bulk');
+      world.features.bulkConfirm = true;
+      for (const res of (bulk.body?.results as any[]) ?? []) {
+        if (!res.ok) continue;
+        const r = requests.find((x) => x.id === res.id);
+        if (r) recordConfirmation(ctx, r, { ...r, status: 'CONFIRMED' });
+      }
+      return;
+    }
+  }
   // First come, first served per shift.
   const byShift = new Map<string, any[]>();
   for (const r of requests) byShift.set(r.shiftId, [...(byShift.get(r.shiftId) ?? []), r]);
@@ -696,7 +749,7 @@ export async function hostCheck(ctx: SimContext, org: SimOrg): Promise<void> {
       else if (res.status !== 409) stats.apiError(res.status, 'POST /assignments/:id/confirm');
     }
   }
-  if (requests.length >= 15) {
+  if (requests.length >= 15 && world.features.bulkConfirm === false) {
     gaps.record({
       id: 'DSP-02',
       title: 'No bulk confirm: each request is confirmed one by one',
@@ -823,6 +876,21 @@ export async function afterShifts(ctx: SimContext, org: SimOrg): Promise<void> {
       if (res.status === 200) {
         stats.current.noShows++;
         if (supplier) supplier.noShowsCaused++;
+        if (rng.chance(0.8)) {
+          const rep = await api.task('Report a concern to the employer', 'rota manager', () => api.post('/api/v1/trust/reports', org.managerToken, { workerId: a.workerId, assignmentId: a.id, category: 'ATTENDANCE', description: 'Did not attend and did not call.' }));
+          if (rep.status === 201) {
+            api.countTask('Report a concern to the employer');
+            stats.current.reportsRaised++;
+            ctx.world.features.reports = true;
+          } else if (rep.status === 404) ctx.world.features.reports = false;
+        }
+        if (supplier && supplier.noShowsCaused >= 2 && rng.chance(0.5)) {
+          const bar = await api.task('Bar a worker from our shifts', 'rota manager', () => api.post('/api/v1/trust/bars', org.managerToken, { workerId: a.workerId, reason: 'Repeated non-attendance' }));
+          if (bar.status === 201) {
+            api.countTask('Bar a worker from our shifts');
+            stats.current.barsCreated++;
+          }
+        }
       }
     }
   }
@@ -974,16 +1042,31 @@ export async function complianceRound(ctx: SimContext, org: SimOrg): Promise<voi
 /** Monthly statements and payment behaviour. */
 export async function monthEnd(ctx: SimContext, periodStart: Date, periodEnd: Date): Promise<void> {
   const { api, world, rng, clock, gaps } = ctx;
-  const res = await api.task('Generate monthly statements', 'agency finance', () => api.post('/api/v1/invoices/generate', world.platformAdminToken, { periodStart: iso(periodStart), periodEnd: iso(periodEnd) }));
-  api.countTask('Generate monthly statements');
-  const created = (res.body as any[]) ?? [];
-  ctx.log(`${fmtDate(clock.now)} statements for ${fmtDate(periodStart)}–${fmtDate(periodEnd)}: ${created.length} issued, £${created.reduce((s, i) => s + i.subtotal, 0).toFixed(0)} billed, £${created.reduce((s, i) => s + i.platformFee, 0).toFixed(0)} platform fee`);
-  // Hosts pay after their lag (scheduled: we record due dates and settle in a later step).
-  for (const inv of created) {
-    const host = world.org(inv.hostOrgId);
-    pendingPayments.push({ invoiceId: inv.id, hostOrgId: inv.hostOrgId, dueAt: new Date(clock.now.getTime() + (host?.payLagDays ?? 30) * DAY) });
+  let run = await api.task('Run monthly settlement', 'agency finance', () => api.post('/api/v1/finance/run', world.platformAdminToken, { periodStart: iso(periodStart), periodEnd: iso(periodEnd) }));
+  let created: any[];
+  if (run.status === 404) {
+    world.features.settlement = false;
+    run = await api.task('Generate monthly statements', 'agency finance', () => api.post('/api/v1/invoices/generate', world.platformAdminToken, { periodStart: iso(periodStart), periodEnd: iso(periodEnd) }));
+    api.countTask('Generate monthly statements');
+    created = (run.body as any[]) ?? [];
+    for (const inv of created) {
+      const host = world.org(inv.hostOrgId);
+      pendingPayments.push({ invoiceId: inv.id, hostOrgId: inv.hostOrgId, dueAt: new Date(clock.now.getTime() + (host?.payLagDays ?? 30) * DAY), kind: 'pair' });
+    }
+  } else {
+    world.features.settlement = true;
+    api.countTask('Run monthly settlement');
+    created = (run.body?.lines as any[]) ?? [];
+    const hostInvoices = (run.body?.hostInvoices as any[]) ?? [];
+    const remittances = (run.body?.remittances as any[]) ?? [];
+    ctx.log(`${fmtDate(clock.now)} settlement for ${fmtDate(periodStart)}–${fmtDate(periodEnd)}: ${hostInvoices.length} host invoice(s) £${hostInvoices.reduce((s, i) => s + (i.total ?? 0), 0).toFixed(0)}, ${remittances.length} remittance(s) £${remittances.reduce((s, i) => s + (i.total ?? 0), 0).toFixed(0)}, agency sales £${created.filter((l) => l.agencySale).reduce((s, l) => s + l.hostCost, 0).toFixed(0)}`);
+    for (const inv of hostInvoices) {
+      const host = world.org(inv.hostOrgId);
+      pendingPayments.push({ invoiceId: inv.id, hostOrgId: inv.hostOrgId, dueAt: new Date(clock.now.getTime() + (host?.payLagDays ?? 30) * DAY), kind: 'host' });
+    }
   }
-  if (created.length > 0) {
+  if (!world.features.settlement) ctx.log(`${fmtDate(clock.now)} statements for ${fmtDate(periodStart)}–${fmtDate(periodEnd)}: ${created.length} issued, £${created.reduce((s, i) => s + i.subtotal, 0).toFixed(0)} billed, £${created.reduce((s, i) => s + i.platformFee, 0).toFixed(0)} platform fee`);
+  if (created.length > 0 && !world.features.settlement) {
     gaps.record({
       id: 'FIN-01',
       title: 'Statements are generated and marked paid by hand; nothing collects money or chases it',
@@ -1000,7 +1083,7 @@ export async function monthEnd(ctx: SimContext, periodStart: Date, periodEnd: Da
   void rng;
 }
 
-export const pendingPayments: Array<{ invoiceId: string; hostOrgId: string; dueAt: Date }> = [];
+export const pendingPayments: Array<{ invoiceId: string; hostOrgId: string; dueAt: Date; kind: 'pair' | 'host' }> = [];
 
 export async function settlePayments(ctx: SimContext): Promise<void> {
   const { api, world, clock } = ctx;
@@ -1008,11 +1091,130 @@ export async function settlePayments(ctx: SimContext): Promise<void> {
     const p = pendingPayments[i]!;
     if (p.dueAt > clock.now) continue;
     const host = world.org(p.hostOrgId);
-    if (!host || host.status !== 'ACTIVE' || host.payLagDays >= 90) continue; // the chronic late payer never pays
-    await api.task('Mark a statement paid', 'host finance', () => api.post(`/api/v1/invoices/${p.invoiceId}/mark-paid`, host.adminToken));
-    api.countTask('Mark a statement paid');
+    if (!host || host.status === 'LEFT' || host.payLagDays >= 90) continue; // the chronic late payer never pays
+    if (p.kind === 'host') {
+      // Decision 1: the host pays the platform; the platform's finance team records the receipt.
+      await api.task('Record a host payment', 'agency finance', () => api.post(`/api/v1/finance/host-invoices/${p.invoiceId}/mark-paid`, world.platformAdminToken, { reference: `BACS-${p.invoiceId.slice(-6)}` }));
+      api.countTask('Record a host payment');
+    } else {
+      await api.task('Mark a statement paid', 'host finance', () => api.post(`/api/v1/invoices/${p.invoiceId}/mark-paid`, host.adminToken));
+      api.countTask('Mark a statement paid');
+    }
     pendingPayments.splice(i, 1);
   }
+}
+
+export async function refreshFloorRate(ctx: SimContext): Promise<void> {
+  const res = await ctx.api.get('/api/v1/shifts/floor-rate', ctx.world.platformAdminToken);
+  ctx.world.floorRate = res.status === 200 ? Number(res.body.floor) || 0 : 0;
+  ctx.world.features.floorRate = res.status === 200;
+}
+
+/**
+ * Decision ONB-01: large employers onboard by spreadsheet. Builds the import file the HR manager would
+ * export from their HR system, previews it, applies it with email invitations, and has the invited
+ * workers click their links. Returns false when the import endpoint does not exist.
+ */
+export async function importWorkers(ctx: SimContext, org: SimOrg, count: number, opts: { loginShare: number; nurses?: boolean }): Promise<boolean> {
+  const { api, rng, clock, world } = ctx;
+  const template = await api.task('Download the import template', 'HR manager', () => api.get('/api/v1/onboarding/import/template.csv', org.adminToken));
+  if (template.status === 404) {
+    world.features.import = false;
+    return false;
+  }
+  world.features.import = true;
+  api.countTask('Download the import template');
+  const rows: Record<string, string>[] = [];
+  const generated: Array<{ email: string; invite: boolean; firstName: string; lastName: string }> = [];
+  const siteNames = org.sites.map((s) => s.name);
+  for (let i = 0; i < count; i++) {
+    const group: RoleGroup = rng.weighted([
+      { v: 'CARE' as RoleGroup, w: opts.nurses ? 65 : 78 },
+      { v: 'SENIOR' as RoleGroup, w: 18 },
+      { v: 'NURSE' as RoleGroup, w: opts.nurses ? 17 : 4 },
+    ]);
+    const jobRole = rng.pick(ROLE_FOR_GROUP[group]);
+    const skills = new Set<Skill>(['MOVING_AND_HANDLING']);
+    if (rng.chance(0.75)) skills.add('DEMENTIA');
+    if (group !== 'CARE' || rng.chance(0.3)) skills.add('MEDICATION');
+    for (const s of SKILL_POOL) if (rng.chance(0.18)) skills.add(s);
+    const name = personName(rng);
+    const pc = postcodeNear(rng, rng.chance(0.7) ? org.area : rng.pick(AREAS));
+    const email = `${name.firstName}.${name.lastName}.${i}@${org.name.toLowerCase().replace(/[^a-z]+/g, '-')}.example`.toLowerCase();
+    const invite = rng.chance(opts.loginShare);
+    const row: Record<string, string> = {
+      firstName: name.firstName,
+      lastName: name.lastName,
+      email,
+      phone: `07${rng.int(100000000, 999999999)}`,
+      jobRole,
+      skills: [...skills].join(';'),
+      contractedHoursPerWeek: String(rng.pick([0, 16, 24, 30, 36, 37.5, 40])),
+      maxHoursPerWeek: '48',
+      postcode: pc.postcode,
+      travelRadiusKm: String(rng.pick([10, 15, 20, 25, 35])),
+      homeSite: rng.pick(siteNames) ?? '',
+      shareable: rng.chance(0.78) ? 'yes' : 'no',
+      invite: invite ? 'yes' : 'no',
+    };
+    for (const type of requiredDocumentsForRole(jobRole)) {
+      const soon = rng.chance(type === 'DBS' ? 0.08 : 0.14);
+      row[`${type}_reference`] = `${type.slice(0, 3)}-${rng.int(100000, 999999)}`;
+      row[`${type}_expiresAt`] = iso(new Date(clock.now.getTime() + (soon ? rng.int(20, 170) : rng.int(200, 1000)) * DAY)).slice(0, 10);
+    }
+    rows.push(row);
+    generated.push({ email, invite, firstName: name.firstName, lastName: name.lastName });
+  }
+  const headers = Array.from(new Set(rows.flatMap((r) => Object.keys(r))));
+  const csv = [headers.join(','), ...rows.map((r) => headers.map((h) => `"${(r[h] ?? '').replace(/"/g, '""')}"`).join(','))].join('\n');
+  const preview = await api.task('Preview a worker import', 'HR manager', () => api.post('/api/v1/onboarding/import/preview', org.adminToken, { fileName: 'staff.csv', contentBase64: Buffer.from(csv).toString('base64') }));
+  api.countTask('Preview a worker import');
+  if (preview.status !== 200 && preview.status !== 201) {
+    ctx.log(`import preview failed for ${org.name}: ${preview.status} ${JSON.stringify(preview.body).slice(0, 200)}`);
+    return false;
+  }
+  const apply = await api.task('Apply a worker import', 'HR manager', () => api.post(`/api/v1/onboarding/import/${preview.body.jobId}/apply`, org.adminToken, { invite: true }));
+  api.countTask('Apply a worker import');
+  if (apply.status !== 200 && apply.status !== 201) {
+    ctx.log(`import apply failed for ${org.name}: ${apply.status} ${JSON.stringify(apply.body).slice(0, 200)}`);
+    return false;
+  }
+  // Documents arrive unverified from a spreadsheet; the compliance officer verifies them in bulk.
+  const queue = await api.task('Review verification queue', 'compliance officer', () => api.get('/api/v1/compliance/verification-queue', org.adminToken));
+  if (queue.status === 200) {
+    api.countTask('Review verification queue');
+    const ids = ((queue.body as any[]) ?? []).map((d) => d.id ?? d.documentId).filter(Boolean);
+    for (let i = 0; i < ids.length; i += 200) {
+      await api.task('Verify documents in bulk', 'compliance officer', () => api.post('/api/v1/compliance/verify', org.adminToken, { documentIds: ids.slice(i, i + 200) }));
+      api.countTask('Verify documents in bulk');
+    }
+  }
+  // Load what was created so the rest of the simulation can use it.
+  const list = await api.get('/api/v1/workers', org.adminToken);
+  for (const w of (list.body as any[]) ?? []) {
+    const group = GROUP_OF_ROLE[w.jobRole as JobRole];
+    org.workers.push({ id: w.id, orgId: org.id, name: `${w.firstName} ${w.lastName}`, jobRole: w.jobRole, group, skills: w.skills ?? [], shareable: !!w.shareable, token: null, email: w.email ?? null, contractedHours: w.contractedHoursPerWeek ?? 0, active: w.status === 'ACTIVE' });
+  }
+  // Invited workers open their email and set a password (decision ONB-02).
+  let accepted = 0;
+  for (const g of generated) {
+    if (!g.invite) continue;
+    const mail = ctx.mailbox(g.email);
+    const token = mail?.match(/\/invite\/([A-Za-z0-9_-]+)/)?.[1];
+    if (!token) continue;
+    const res = await api.task('Worker accepts an invitation', 'care worker (phone)', () => api.post(`/api/v1/onboarding/invitations/${token}/accept`, null, { password: `Welcome-${rng.int(100000, 999999)}-ok` }));
+    api.countTask('Worker accepts an invitation');
+    if (res.status === 200 || res.status === 201) {
+      const w = org.workers.find((x) => x.email === g.email);
+      if (w) {
+        w.token = res.body.token ?? null;
+        accepted++;
+      }
+    }
+  }
+  world.features.invitations = accepted > 0;
+  ctx.log(`${fmtDate(clock.now)} ${org.name}: imported ${org.workers.length} workers from a spreadsheet; ${generated.filter((g) => g.invite).length} invited by email, ${accepted} accepted`);
+  return true;
 }
 
 export function monthOf(d: Date): number {

@@ -53,7 +53,7 @@ export function renderReport(r: Result): string {
       const ag = sum(ws.map((w) => w.confirmedViaAgency));
       const ttf = median(ws.flatMap((w) => w.timeToFillMinutes));
       const last = ws[ws.length - 1]!;
-      return `| ${i + 1} | ${ws[0]!.weekStart} | ${last.providers} | ${last.workers.toLocaleString()} | ${posted} | ${sum(ws.map((w) => w.urgentPosted))} | ${pct(filled, places)} | ${expired} | ${pct(pr, conf)} / ${pct(ag, conf)} | ${fmtMin(ttf)} | ${sum(ws.map((w) => w.lateCancellations))} / ${sum(ws.map((w) => w.noShows))} | ${Math.round(sum(ws.map((w) => w.hoursTraded))).toLocaleString()} | £${Math.round(sum(ws.map((w) => w.chargeTraded))).toLocaleString()} | £${Math.round(sum(ws.map((w) => w.platformFee))).toLocaleString()} |`;
+      return `| ${i + 1} | ${ws[0]!.weekStart} | ${last.providers} | ${last.workers.toLocaleString()} | ${posted} | ${sum(ws.map((w) => w.urgentPosted))} | ${pct(filled, places)} | ${expired} | ${pct(pr, conf)} / ${pct(ag, conf)} | ${fmtMin(ttf)} | ${sum(ws.map((w) => w.lateCancellations))} / ${sum(ws.map((w) => w.noShows))} | ${Math.round(sum(ws.map((w) => w.hoursTraded))).toLocaleString()} | £${Math.round(sum(ws.map((w) => w.chargeTraded))).toLocaleString()} | £${Math.round(sum(ws.map((w) => w.platformFee))).toLocaleString()} | ${sum(ws.map((w) => w.escalatedShifts ?? 0))} | ${sum(ws.map((w) => w.reportsRaised ?? 0))} / ${sum(ws.map((w) => w.barsCreated ?? 0))} | ${sum(ws.map((w) => w.emailsSent ?? 0)).toLocaleString()} |`;
     })
     .join('\n');
 
@@ -146,10 +146,10 @@ ${providerRows}
 
 ## Month by month
 
-| Month | From | Providers | Workers | Shifts posted | Urgent | Places filled | Started unfilled | Filled via priority / agency | Median time to fill | Late cancels / no-shows | Hours traded | Charged | Platform fee |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Month | From | Providers | Workers | Shifts posted | Urgent | Places filled | Started unfilled | Filled via priority / agency | Median time to fill | Late cancels / no-shows | Hours traded | Charged | Platform fee | Shifts auto-escalated | Reports / bars | Emails sent |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 ${monthRows}
-| **Total** | | | | **${totals.posted.toLocaleString()}** | ${sum(r.weeks.map((w) => w.urgentPosted))} | **${pct(totals.filled, totals.places)}** | **${totals.expired}** | ${pct(totals.pr, totals.conf)} / ${pct(totals.ag, totals.conf)} | ${fmtMin(median(r.weeks.flatMap((w) => w.timeToFillMinutes)))} | ${totals.late} / ${totals.noShows} | **${Math.round(totals.hours).toLocaleString()}** | **£${Math.round(totals.charge).toLocaleString()}** | **£${Math.round(totals.fee).toLocaleString()}** |
+| **Total** | | | | **${totals.posted.toLocaleString()}** | ${sum(r.weeks.map((w) => w.urgentPosted))} | **${pct(totals.filled, totals.places)}** | **${totals.expired}** | ${pct(totals.pr, totals.conf)} / ${pct(totals.ag, totals.conf)} | ${fmtMin(median(r.weeks.flatMap((w) => w.timeToFillMinutes)))} | ${totals.late} / ${totals.noShows} | **${Math.round(totals.hours).toLocaleString()}** | **£${Math.round(totals.charge).toLocaleString()}** | **£${Math.round(totals.fee).toLocaleString()}** | ${sum(r.weeks.map((w) => w.escalatedShifts ?? 0))} | ${sum(r.weeks.map((w) => w.reportsRaised ?? 0))} / ${sum(r.weeks.map((w) => w.barsCreated ?? 0))} | ${sum(r.weeks.map((w) => w.emailsSent ?? 0)).toLocaleString()} |
 
 "Filled via priority" is the share of confirmed bookings whose supplier had priority access from a surplus flag or preferred-partner status; "agency" is the share filled by the agency's own bank. Weeks 17–20 ran with the agency bank released first; compare the agency share in months 4–5 with the rest.
 

@@ -35,6 +35,7 @@ import {
   planWeek,
   postDueShifts,
   resolveDisputes,
+  refreshFloorRate,
   settlePayments,
   supplierCheck,
   workerCheck,
@@ -52,25 +53,25 @@ const SEED = arg('seed', 42);
 const STEP_HOURS = 2;
 
 const PROVIDERS: ProviderSpec[] = [
-  { name: 'Northern Care Group', size: 'large', staff: 400, sites: 8, serviceType: 'NURSING', joinWeek: 0, balance: { CARE: -14, SENIOR: -3, NURSE: -3 } },
+  { name: 'Northern Care Group', size: 'large', staff: 400, sites: 8, serviceType: 'NURSING', joinWeek: 0, autoEscalate: true, balance: { CARE: -14, SENIOR: -3, NURSE: -3 } },
   { name: 'Riverside Living', size: 'medium', staff: 45, sites: 1, serviceType: 'RESIDENTIAL', joinWeek: 0, selfService: true, balance: { CARE: 4, SENIOR: 1, NURSE: 0 } },
   { name: 'Oakwood Care Homes', size: 'medium', staff: 90, sites: 2, serviceType: 'NURSING', joinWeek: 0, balance: { CARE: -5, SENIOR: -1, NURSE: -1 } },
   { name: 'Bright Horizons Support', size: 'small', staff: 22, sites: 1, serviceType: 'SUPPORTED_LIVING', joinWeek: 2, balance: { CARE: 2, SENIOR: 0, NURSE: 0 } },
-  { name: 'Meadow View', size: 'small', staff: 18, sites: 1, serviceType: 'RESIDENTIAL', joinWeek: 2, balance: { CARE: -2, SENIOR: 0, NURSE: 0 }, reliability: 0.85 },
+  { name: 'Meadow View', size: 'small', staff: 18, sites: 1, serviceType: 'RESIDENTIAL', joinWeek: 2, autoEscalate: true, balance: { CARE: -2, SENIOR: 0, NURSE: 0 }, reliability: 0.85 },
   { name: 'Pennine Nursing', size: 'medium', staff: 70, sites: 2, serviceType: 'NURSING', joinWeek: 4, balance: { CARE: -2, SENIOR: 0, NURSE: -2 } },
   { name: 'Hillside Care', size: 'small', staff: 25, sites: 1, serviceType: 'RESIDENTIAL', joinWeek: 4, selfService: true, balance: { CARE: 3, SENIOR: 1, NURSE: 0 } },
   { name: 'Lakeside Lodge', size: 'small', staff: 14, sites: 1, serviceType: 'RESIDENTIAL', joinWeek: 4, payLagDays: 95, balance: { CARE: -1, SENIOR: 0, NURSE: 0 } },
   { name: 'Trafford Care Partnership', size: 'large', staff: 250, sites: 5, serviceType: 'RESIDENTIAL', joinWeek: 6, selfService: true, balance: { CARE: 6, SENIOR: 2, NURSE: 0 } },
   { name: 'Willow Homecare', size: 'small', staff: 30, sites: 1, serviceType: 'DOMICILIARY', joinWeek: 6, balance: { CARE: 2, SENIOR: 0, NURSE: 0 } },
-  { name: "St Anne's Residential", size: 'medium', staff: 55, sites: 1, serviceType: 'RESIDENTIAL', joinWeek: 9, autoConfirm: true, balance: { CARE: -3, SENIOR: -1, NURSE: 0 } },
+  { name: "St Anne's Residential", size: 'medium', staff: 55, sites: 1, serviceType: 'RESIDENTIAL', joinWeek: 9, autoConfirm: true, autoEscalate: true, balance: { CARE: -3, SENIOR: -1, NURSE: 0 } },
   { name: 'Cedar Court', size: 'medium', staff: 60, sites: 1, serviceType: 'NURSING', joinWeek: 9, balance: { CARE: 1, SENIOR: 0, NURSE: -1 } },
   { name: 'Sunnybank', size: 'small', staff: 16, sites: 1, serviceType: 'RESIDENTIAL', joinWeek: 9, balance: { CARE: -1, SENIOR: 0, NURSE: 0 } },
   { name: 'Harmony Supported Living', size: 'small', staff: 28, sites: 1, serviceType: 'SUPPORTED_LIVING', joinWeek: 9, selfService: true, balance: { CARE: 3, SENIOR: 0, NURSE: 0 } },
-  { name: 'Greenfield Manor', size: 'medium', staff: 48, sites: 1, serviceType: 'NURSING', joinWeek: 12, reliability: 0.9, balance: { CARE: -4, SENIOR: -1, NURSE: -1 } },
+  { name: 'Greenfield Manor', size: 'medium', staff: 48, sites: 1, serviceType: 'NURSING', joinWeek: 12, autoEscalate: true, reliability: 0.9, balance: { CARE: -4, SENIOR: -1, NURSE: -1 } },
   { name: 'Birch House', size: 'small', staff: 12, sites: 1, serviceType: 'RESIDENTIAL', joinWeek: 12, balance: { CARE: 1, SENIOR: 0, NURSE: 0 } },
   { name: 'Elm Tree Care', size: 'small', staff: 20, sites: 1, serviceType: 'RESIDENTIAL', joinWeek: 15, balance: { CARE: -2, SENIOR: 0, NURSE: 0 } },
   { name: 'Mosaic Community Support', size: 'small', staff: 26, sites: 1, serviceType: 'SUPPORTED_LIVING', joinWeek: 15, balance: { CARE: 2, SENIOR: 1, NURSE: 0 } },
-  { name: 'Northgate Nursing', size: 'medium', staff: 65, sites: 2, serviceType: 'NURSING', joinWeek: 18, balance: { CARE: -3, SENIOR: 0, NURSE: -2 } },
+  { name: 'Northgate Nursing', size: 'medium', staff: 65, sites: 2, serviceType: 'NURSING', joinWeek: 18, autoEscalate: true, balance: { CARE: -3, SENIOR: 0, NURSE: -2 } },
   { name: 'The Beeches', size: 'small', staff: 15, sites: 1, serviceType: 'RESIDENTIAL', joinWeek: 18, balance: { CARE: 1, SENIOR: 0, NURSE: 0 } },
 ];
 
@@ -104,7 +105,15 @@ async function main() {
     logLines.push(m);
     console.log(m);
   };
-  const ctx: SimContext = { api, clock, rng, gaps, log, world, stats };
+  const mailbox = (email: string): string | null => {
+    try {
+      const row = sqlite.prepare(`select body from outbound_messages where channel = 'EMAIL' and to_address = ? order by created_at desc limit 1`).get(email) as { body: string } | undefined;
+      return row?.body ?? null;
+    } catch {
+      return null; // table absent on an older API
+    }
+  };
+  const ctx: SimContext = { api, clock, rng, gaps, log, world, stats, mailbox };
   const tick = () => api.post('/api/v1/admin/scheduler/tick', world.platformAdminToken);
 
   log(`Merge market-entry simulation: ${WEEKS} weeks from ${fmtDate(SIM_START)}, seed ${SEED}`);
@@ -127,6 +136,7 @@ async function main() {
     }
     stats.current.providers = world.providers().length;
     stats.current.workers = world.workerCount();
+    await refreshFloorRate(ctx);
     for (const org of world.activeOrgs()) {
       planWeek(ctx, org, week);
       await manageFlags(ctx, org, week);
@@ -167,6 +177,13 @@ async function main() {
     // Week-end bookkeeping.
     const pending = await api.get('/api/v1/timesheets?scope=all&status=SUBMITTED', world.platformAdminToken);
     stats.current.timesheetsPendingEnd = ((pending.body as any[]) ?? []).length;
+    try {
+      const since = weekStart.getTime();
+      stats.current.escalatedShifts = (sqlite.prepare(`select count(*) c from shifts where escalation_step > 0 and published_at >= ?`).get(since) as { c: number }).c;
+      stats.current.emailsSent = (sqlite.prepare(`select count(*) c from outbound_messages where channel = 'EMAIL' and created_at >= ?`).get(since) as { c: number }).c;
+    } catch {
+      /* columns absent on an older API */
+    }
     log(ev.describeWeek(ctx, week));
     void agencyFirstActive;
   }
