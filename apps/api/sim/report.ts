@@ -18,7 +18,7 @@ interface Result {
 
 /** Verifier text can contain line breaks and nested bullets, which break the report's own lists; flatten it. */
 function flat(text: string): string {
-  return text.replace(/\s*\n+\s*(?:[-*•]\s+)?/g, ' ').replace(/\s{2,}/g, ' ').trim();
+  return text.replace(/^\s*[-*•]\s+/, '').replace(/\s*\n+\s*(?:[-*•]\s+)?/g, ' ').replace(/\s{2,}/g, ' ').trim();
 }
 
 /** Long verifier evidence is cut at a sentence boundary for the report; the full text stays in result.json. */

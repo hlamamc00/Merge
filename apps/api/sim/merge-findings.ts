@@ -47,7 +47,7 @@ const KEEP_DECISION = new Set(['PH-01', 'PH-02', 'PH-03', 'PR-02', 'PR-04', 'PW-
 for (const f of findings) if (!KEEP_DECISION.has(f.id)) delete f.decisionNeeded;
 const existing = new Set((result.gaps as Gap[]).map((g) => g.id));
 for (const g of result.gaps as Gap[]) {
-  if (extensions[g.id]) g.evidence += extensions[g.id];
+  if (extensions[g.id] && !g.evidence.includes(extensions[g.id]!)) g.evidence += extensions[g.id]; // idempotent on re-runs
 }
 let added = 0;
 for (const f of findings) {
