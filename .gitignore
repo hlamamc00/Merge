@@ -11,3 +11,4 @@ dist/
 coverage/
 .DS_Store
 .vite/
+apps/api/sim-output/

@@ -2,7 +2,15 @@
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
     "noEmit": true,
-    "types": ["node"]
+    "types": [
+      "node"
+    ]
   },
-  "include": ["src", "test", "drizzle.config.ts", "vitest.config.ts"]
+  "include": [
+    "drizzle.config.ts",
+    "sim",
+    "src",
+    "test",
+    "vitest.config.ts"
+  ]
 }

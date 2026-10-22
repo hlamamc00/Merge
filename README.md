@@ -95,6 +95,10 @@ The API refuses to start with `NODE_ENV=production` unless `JWT_SECRET` is a ran
 
 Full details, including the agency-position settings and worked examples, are in [docs/DISPATCH-AND-PRIORITY.md](docs/DISPATCH-AND-PRIORITY.md).
 
+## Market-entry simulation
+
+`npm run sim -w @merge/api` plays out six months of adoption by twenty providers and an agency bank through the real API, and writes [docs/SIMULATION-REPORT.md](docs/SIMULATION-REPORT.md): fill rates, time to fill, calls per human task, and a gap register of everything that was impossible, clumsy or silently wrong. See [apps/api/sim/README.md](apps/api/sim/README.md).
+
 ## Documentation
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) – stack, modules, request flow, scheduler, deployment notes
