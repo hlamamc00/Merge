@@ -29,7 +29,7 @@ const extensionsPath = resolve(dir, 'persona-extensions.json');
 const extensions = existsSync(extensionsPath) ? (JSON.parse(readFileSync(extensionsPath, 'utf8')) as Record<string, string>) : {};
 /** Defects corrected during the exercise (see the "Fixed during the exercise" section of the report). */
 const FIXED: Record<string, string> = {
-  'PH-02': 'A worker login now ends when the worker record is deactivated (requireAuth checks the linked worker).',
+  'PH-02': 'A worker login now ends when the worker record is deactivated (requireAuth and login check the linked worker). Cancelling or reassigning a leaver\'s future bookings remains open; see WF-02.',
   'PT-04': 'Worker logins can no longer read or edit colleagues\' records; organisation-wide worker access needs a manager role.',
   'PF-01': 'Statement runs now bill every approved, un-invoiced timesheet up to the period end, so late approvals are caught up.',
   'PR-01': 'Site access notes are released only to an organisation with a confirmed booking on that shift.',
@@ -38,7 +38,6 @@ const FIXED: Record<string, string> = {
   'PM-05': 'The release plan is kept when a shift starts or is cancelled, as the record of who was offered it and when.',
   'PR-03': 'When a cancellation reopens a filled shift, organisations whose stage is open are notified again.',
   'PW-03': 'Worker logins no longer see the inter-organisation charge rate as if it were their pay.',
-  'WF-02': 'Covered by the deactivation fix for logins; cancelling the future bookings of a leaver remains an open proposal.',
 };
 /**
  * Persona verifiers attached a decision to every finding. Only those that materially change what gets built

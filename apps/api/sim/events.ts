@@ -50,7 +50,7 @@ export async function probeWorkerTransfer(ctx: SimContext, from: SimOrg, to: Sim
   let w: SimWorker | undefined;
   for (const candidate of [from, ...ctx.world.providers().filter((o) => o.id !== from.id && o.id !== to.id)]) {
     const booked = ((await api.get('/api/v1/assignments?scope=outgoing&status=CONFIRMED', candidate.managerToken)).body as any[]) ?? [];
-    const found = candidate.workers.find((x) => x.active && x.shareable && booked.some((a) => a.workerId === x.id));
+    const found = candidate.workers.find((x) => x.active && x.shareable && booked.some((a) => a.workerId === x.id && new Date(a.shift.startsAt) > ctx.clock.now));
     if (found) {
       w = found;
       from = candidate;

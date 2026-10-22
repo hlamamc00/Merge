@@ -16,8 +16,14 @@ interface Result {
   fixed?: Record<string, string>;
 }
 
+/** Verifier text can contain line breaks and nested bullets, which break the report's own lists; flatten it. */
+function flat(text: string): string {
+  return text.replace(/\s*\n+\s*(?:[-*•]\s+)?/g, ' ').replace(/\s{2,}/g, ' ').trim();
+}
+
 /** Long verifier evidence is cut at a sentence boundary for the report; the full text stays in result.json. */
-function trim(text: string, max = 900): string {
+function trim(raw: string, max = 900): string {
+  const text = flat(raw);
   if (text.length <= max) return text;
   const cut = text.slice(0, max);
   const end = Math.max(cut.lastIndexOf('. '), cut.lastIndexOf('; '));
@@ -108,15 +114,15 @@ export function renderReport(r: Result): string {
               `#### ${g.id} · ${g.title}\n\n` +
               `**Severity:** ${sevIcon[g.severity]} · **Seen by:** ${g.persona} · **First hit:** month ${g.month + 1}${g.occurrences > 1 ? ` · **Recurred:** ${g.occurrences}×` : ''}${g.status === 'fixed' ? ' · **Status:** ✅ fixed during the exercise' : ''}\n\n` +
               `- **What happened:** ${trim(g.evidence)}\n` +
-              `- **Why it matters:** ${g.impact}\n` +
-              `- **Proposed solution:** ${g.proposal}\n` +
-              (g.decisionNeeded ? `- **Decision needed:** ${g.decisionNeeded}\n` : ''),
+              `- **Why it matters:** ${flat(g.impact)}\n` +
+              `- **Proposed solution:** ${flat(g.proposal)}\n` +
+              (g.decisionNeeded ? `- **Decision needed:** ${flat(g.decisionNeeded)}\n` : ''),
           )
           .join('\n'),
     )
     .join('\n');
 
-  const decisions = r.gaps.filter((g) => g.decisionNeeded).map((g, i) => `${i + 1}. **${g.id}** – ${g.decisionNeeded}`).join('\n');
+  const decisions = r.gaps.filter((g) => g.decisionNeeded).map((g, i) => `${i + 1}. **${g.id}** – ${flat(g.decisionNeeded!)}`).join('\n');
   const counts = { blocker: 0, high: 0, medium: 0, low: 0 } as Record<string, number>;
   for (const g of r.gaps) counts[g.severity]!++;
 
