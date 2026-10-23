@@ -96,6 +96,9 @@ export class ApiClient {
     }
   }
 
+  /** Called when a login is refused because its organisation was suspended by the platform (e.g. repeated no-shows). */
+  onSuspended?: (token: string, error: string) => void;
+
   async call<T = any>(method: string, path: string, token: string | null, body?: unknown): Promise<{ status: number; body: T; contentType: string | null }> {
     const started = performance.now();
     const headers: Record<string, string> = { accept: 'application/json' };
@@ -111,6 +114,7 @@ export class ApiClient {
     }
     const ms = performance.now() - started;
     this.calls.push({ task: this.currentTask, actor: this.currentActor, method, path: path.replace(/\/[a-z]+_[a-z0-9]{16}/g, '/:id'), status: res.status, ms, error: res.status >= 400 ? parsed?.error : undefined });
+    if (res.status === 403 && token && typeof parsed?.error === 'string' && /suspended/i.test(parsed.error)) this.onSuspended?.(token, parsed.error);
     return { status: res.status, body: parsed, contentType: res.headers.get('content-type') };
   }
 
@@ -275,4 +279,9 @@ export function median(xs: number[]): number | null {
   if (xs.length === 0) return null;
   const s = [...xs].sort((a, b) => a - b);
   return s[Math.floor(s.length / 2)]!;
+}
+
+/** The array body of a list response, or [] when the call failed (an error object is never iterated). */
+export function listOf<T = any>(res: { status: number; body: unknown }): T[] {
+  return Array.isArray(res.body) ? (res.body as T[]) : [];
 }

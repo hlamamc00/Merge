@@ -4,7 +4,7 @@
  * A probe that finds the feature working records the gap as fixed, with the numbers that show it.
  */
 import { requiredDocumentsForRole } from '@merge/shared';
-import { DAY, HOUR, iso, fmtDate } from './lib.js';
+import { DAY, HOUR, iso, fmtDate, listOf } from './lib.js';
 import { SIM_START, monthOf, type SimContext, type SimOrg, type SimWorker } from './scenario.js';
 
 export async function probeMissingEndpoints(ctx: SimContext, org: SimOrg): Promise<void> {
@@ -68,7 +68,7 @@ export async function probeWorkerTransfer(ctx: SimContext, from: SimOrg, to: Sim
   // A leaver with bookings still ahead of them is the realistic (and revealing) case; look across the network for one.
   let w: SimWorker | undefined;
   for (const candidate of [from, ...ctx.world.providers().filter((o) => o.id !== from.id && o.id !== to.id)]) {
-    const booked = ((await api.get('/api/v1/assignments?scope=outgoing&status=CONFIRMED', candidate.managerToken)).body as any[]) ?? [];
+    const booked = listOf(await api.get('/api/v1/assignments?scope=outgoing&status=CONFIRMED', candidate.managerToken));
     const found = candidate.workers.find((x) => x.active && x.shareable && booked.some((a) => a.workerId === x.id && new Date(a.shift.startsAt) > ctx.clock.now));
     if (found) {
       w = found;
@@ -155,15 +155,15 @@ export async function probeBlocklist(ctx: SimContext, host: SimOrg): Promise<voi
   const { api, gaps, clock, world } = ctx;
   const worst = world.providers().filter((o) => o.id !== host.id).sort((a, b) => b.noShowsCaused - a.noShowsCaused)[0];
   if (!worst || worst.noShowsCaused === 0) return;
-  const confirmedWith = ((await api.get('/api/v1/assignments?scope=incoming&status=CONFIRMED', host.managerToken)).body as any[]).filter((a) => a.supplierOrgId === worst.id);
+  const confirmedWith = listOf(await api.get('/api/v1/assignments?scope=incoming&status=CONFIRMED', host.managerToken)).filter((a) => a.supplierOrgId === worst.id);
   // Decision 4: the host reads the supplier's record first, then blocks the organisation and bars the person who did not turn up.
   const reliability = await api.task('Check a supplier\'s reliability record', 'org admin', () => api.get(`/api/v1/trust/reliability/${worst.id}`, host.managerToken));
   const res = await api.task('Block a supplier', 'org admin', () => api.put(`/api/v1/organisations/${host.id}/relationships/${worst.id}`, host.adminToken, { kind: 'BLOCKED', note: `${worst.noShowsCaused} no-shows` }));
   api.countTask('Block a supplier');
   worst.blockedBy.push(host.id);
-  const noShows = ((await api.task('Find who did not turn up', 'org admin', () => api.get('/api/v1/assignments?scope=incoming&status=NO_SHOW', host.managerToken))).body as any[]) ?? [];
+  const noShows = listOf(await api.task('Find who did not turn up', 'org admin', () => api.get('/api/v1/assignments?scope=incoming&status=NO_SHOW', host.managerToken)));
   let culprit = noShows.find((a) => a.supplierOrgId === worst.id);
-  if (!culprit) culprit = (((await api.get('/api/v1/assignments?scope=incoming', host.managerToken)).body as any[]) ?? []).find((a) => a.supplierOrgId === worst.id);
+  if (!culprit) culprit = (listOf(await api.get('/api/v1/assignments?scope=incoming', host.managerToken))).find((a) => a.supplierOrgId === worst.id);
   const bar = culprit ? await api.task('Bar a worker from our shifts', 'org admin', () => api.post('/api/v1/trust/bars', host.managerToken, { workerId: culprit.workerId, reason: 'Did not attend and did not call', shareReason: true })) : null;
   if (bar && (bar.status === 201 || bar.status === 409)) api.countTask('Bar a worker from our shifts');
   const standing = await api.task('Review a supplier\'s standing', 'agency owner', () => api.get(`/api/v1/organisations/${worst.id}`, world.platformAdminToken));
@@ -211,7 +211,7 @@ export async function probeInspectorRequest(ctx: SimContext, host: SimOrg): Prom
   const manual = 'Inspector asks who worked at a site (by hand, for comparison)';
   const started = api.calls.length;
   const ts = await api.task(manual, 'registered manager', () => api.get('/api/v1/timesheets?scope=payable&status=APPROVED', host.adminToken));
-  const atSite = ((ts.body as any[]) ?? []).slice(0, 25);
+  const atSite = listOf(ts).slice(0, 25);
   let refused = 0;
   for (const t of atSite) {
     const lookup = await api.task(manual, 'registered manager', () => api.get(`/api/v1/workers/${t.workerId}`, host.adminToken));
@@ -253,15 +253,15 @@ export async function probeInspectorRequest(ctx: SimContext, host: SimOrg): Prom
 
 export async function probeSuspension(ctx: SimContext, org: SimOrg): Promise<void> {
   const { api, gaps, clock, world } = ctx;
-  let openBefore = ((await api.get('/api/v1/shifts?scope=posted', org.managerToken)).body as any[]).filter((s) => s.status === 'OPEN');
-  let outgoing = ((await api.get('/api/v1/assignments?scope=outgoing&status=CONFIRMED', org.managerToken)).body as any[]) ?? [];
+  let openBefore = listOf(await api.get('/api/v1/shifts?scope=posted', org.managerToken)).filter((s) => s.status === 'OPEN');
+  let outgoing = listOf(await api.get('/api/v1/assignments?scope=outgoing&status=CONFIRMED', org.managerToken));
   if (openBefore.length === 0 && outgoing.length === 0) {
     // The chronic late payer is quiet this week; suspend the busiest small or medium host instead so the effect is visible.
     const candidates = world.providers().filter((o) => o.id !== org.id && o.size !== 'large');
     let best: { o: SimOrg; open: any[]; out: any[] } | null = null;
     for (const o of candidates) {
-      const open = ((await api.get('/api/v1/shifts?scope=posted', o.managerToken)).body as any[]).filter((s) => s.status === 'OPEN');
-      const out = ((await api.get('/api/v1/assignments?scope=outgoing&status=CONFIRMED', o.managerToken)).body as any[]) ?? [];
+      const open = listOf(await api.get('/api/v1/shifts?scope=posted', o.managerToken)).filter((s) => s.status === 'OPEN');
+      const out = listOf(await api.get('/api/v1/assignments?scope=outgoing&status=CONFIRMED', o.managerToken));
       if (!best || open.length + out.length > best.open.length + best.out.length) best = { o, open, out };
     }
     if (best && best.open.length + best.out.length > 0) {
@@ -277,7 +277,7 @@ export async function probeSuspension(ctx: SimContext, org: SimOrg): Promise<voi
   // Can the network still see and request their shifts?
   const other = world.providers().find((o) => o.id !== org.id)!;
   const board = await api.get('/api/v1/shifts?scope=available', other.managerToken);
-  const stillVisible = ((board.body as any[]) ?? []).filter((s) => openBefore.some((o) => o.id === s.id));
+  const stillVisible = listOf(board).filter((s) => openBefore.some((o) => o.id === s.id));
   const login = await api.get('/api/v1/auth/me', org.managerToken);
   // Hosts holding its staff on shifts still to start: were they told?
   const hostIds = [...new Set(outgoing.filter((a) => new Date(a.shift.startsAt) > clock.now).map((a) => a.shift.hostOrgId as string))];
@@ -375,7 +375,7 @@ export async function probeOffboarding(ctx: SimContext, org: SimOrg): Promise<vo
   const { api, gaps, clock, world } = ctx;
   const close = await api.task('Organisation leaves the network', 'org admin', () => api.post(`/api/v1/organisations/${org.id}/close`, org.adminToken, { reason: 'Moving to another platform' }));
   const selfStatus = await api.task('Organisation leaves the network', 'org admin', () => api.patch(`/api/v1/organisations/${org.id}`, org.adminToken, { status: 'SUSPENDED' }));
-  const outstanding = ((await api.get('/api/v1/invoices?scope=payable', org.adminToken)).body as any[]).filter((i) => i.status === 'ISSUED');
+  const outstanding = listOf(await api.get('/api/v1/invoices?scope=payable', org.adminToken)).filter((i) => i.status === 'ISSUED');
   await api.patch(`/api/v1/organisations/${org.id}`, world.platformAdminToken, { status: 'SUSPENDED' });
   org.status = 'LEFT';
   gaps.record({
@@ -438,7 +438,7 @@ export async function probePagination(ctx: SimContext): Promise<void> {
   const started = performance.now();
   const all = await api.task('Platform admin lists all shifts', 'agency ops', () => api.get('/api/v1/shifts?scope=all', world.platformAdminToken));
   const ms = Math.round(performance.now() - started);
-  const rows = ((all.body as any[]) ?? []).length;
+  const rows = listOf(all).length;
   const large = world.providers().find((o) => o.size === 'large');
   let posted = 0;
   let postedMs = 0;
@@ -446,7 +446,7 @@ export async function probePagination(ctx: SimContext): Promise<void> {
     const t = performance.now();
     const res = await api.task('Rota manager lists posted shifts', 'rota manager', () => api.get('/api/v1/shifts?scope=posted&includePast=true', large.managerToken));
     postedMs = Math.round(performance.now() - t);
-    posted = ((res.body as any[]) ?? []).length;
+    posted = listOf(res).length;
   }
   if (rows > 1000 || ms > 500 || postedMs > 500) {
     gaps.record({

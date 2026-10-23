@@ -16,7 +16,7 @@ import { silentChannels } from '../src/services/mail.js';
 import { setOutboxChannels } from '../src/services/scheduler.js';
 import { openDatabase, runMigrations } from '../src/db/client.js';
 import type { NotificationChannel } from '../src/lib/notify.js';
-import { ApiClient, Clock, DAY, GapRegister, HOUR, Rng, fmtDate } from './lib.js';
+import { ApiClient, Clock, DAY, GapRegister, HOUR, Rng, fmtDate, listOf } from './lib.js';
 import * as ev from './events.js';
 import { renderReport } from './report.js';
 import { deriveGapsFromWeeks } from './derive.js';
@@ -103,6 +103,12 @@ async function main() {
   await new Promise<void>((r) => server.once('listening', () => r()));
   const port = (server.address() as AddressInfo).port;
   const api = new ApiClient(`http://127.0.0.1:${port}`);
+  api.onSuspended = (token, error) => {
+    const org = world.orgs.find((o) => o.adminToken === token || o.managerToken === token || o.siteManagerToken === token || o.workers.some((w) => w.token === token));
+    if (!org || org.status !== 'ACTIVE') return;
+    org.status = 'SUSPENDED';
+    log(`${fmtDate(clock.now)} ${org.name} was suspended by the platform (${error}); its people are locked out until the agency reinstates it`);
+  };
   const rng = new Rng(SEED);
   const gaps = new GapRegister();
   const world = new World();
@@ -197,7 +203,7 @@ async function main() {
     }
     // Week-end bookkeeping.
     const pending = await api.get('/api/v1/timesheets?scope=all&status=SUBMITTED', world.platformAdminToken);
-    stats.current.timesheetsPendingEnd = ((pending.body as any[]) ?? []).length;
+    stats.current.timesheetsPendingEnd = listOf(pending).length;
     try {
       const since = weekStart.getTime();
       stats.current.escalatedShifts = (sqlite.prepare(`select count(*) c from shifts s join organisations o on o.id = s.host_org_id where s.escalation_step > 0 and o.escalation_mode = 'AUTO' and s.published_at >= ?`).get(since) as { c: number }).c;

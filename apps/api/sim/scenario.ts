@@ -7,7 +7,7 @@
  * of calls a task needs is a direct measure of how laborious it is today.
  */
 import { requiredDocumentsForRole, type DocumentType, type JobRole, type Skill } from '@merge/shared';
-import { AREAS, ApiClient, Clock, DAY, GapRegister, HOUR, Rng, fmtDate, iso, personName, postcodeNear, round1 } from './lib.js';
+import { AREAS, ApiClient, Clock, DAY, GapRegister, HOUR, Rng, fmtDate, iso, personName, postcodeNear, round1, listOf } from './lib.js';
 import { totpCode } from '../src/lib/totp.js';
 
 export type RoleGroup = 'CARE' | 'SENIOR' | 'NURSE';
@@ -489,12 +489,12 @@ async function probeSiteScopedManager(ctx: SimContext, org: SimOrg): Promise<voi
   const homeDraft = await api.task('Prepare a draft shift', 'group admin', () => draft(home, org.adminToken));
   const otherDraft = await api.task('Prepare a draft shift', 'group admin', () => draft(other, org.adminToken));
   const rota = await api.task('Home manager reviews the rota', 'home manager', () => api.get('/api/v1/shifts?scope=posted', org.siteManagerToken!));
-  const rows = (rota.body as any[]) ?? [];
+  const rows = listOf(rota);
   const offSite = rows.filter((s) => s.siteId !== home.id);
   const denied = await api.task('Home manager posts for another site', 'home manager', () => draft(other, org.siteManagerToken!));
   const allowed = await api.task('Home manager posts for their site', 'home manager', () => draft(home, org.siteManagerToken!));
   const staff = await api.task('Home manager reviews staff', 'home manager', () => api.get('/api/v1/workers', org.siteManagerToken!));
-  const staffOffSite = ((staff.body as any[]) ?? []).filter((w) => w.homeSiteId && w.homeSiteId !== home.id);
+  const staffOffSite = listOf(staff).filter((w) => w.homeSiteId && w.homeSiteId !== home.id);
   for (const d of [homeDraft, otherDraft, allowed]) if (d.status === 201) await api.post(`/api/v1/shifts/${d.body.id}/cancel`, org.adminToken, { reason: 'Access check only' });
   const ok = rota.status === 200 && rows.length >= 1 && offSite.length === 0 && denied.status === 403 && allowed.status === 201 && staff.status === 200 && staffOffSite.length === 0;
   if (!ok) return open(`A manager invited for ${home.name} only: GET /shifts?scope=posted → ${rota.status} with ${rows.length} rows (${offSite.length} from other sites); POST /shifts for ${other.name} → ${denied.status} (expected 403); for ${home.name} → ${allowed.status}; GET /workers → ${staff.status} with ${staffOffSite.length} worker(s) based elsewhere.`);
@@ -506,7 +506,7 @@ async function probeSiteScopedManager(ctx: SimContext, org: SimOrg): Promise<voi
     persona: 'Regional manager of a care group',
     month: 0,
     status: 'fixed',
-    evidence: `${org.name} (${org.sites.length} sites) invited a manager limited to ${home.name} by email; after accepting, their rota showed ${rows.length} shift(s), all at that site (the group's ${other.name} draft was hidden), POST /shifts for ${other.name} was refused (403) while their own site's was accepted (201), and GET /workers listed only staff based at ${home.name} or unassigned (${((staff.body as any[]) ?? []).length} rows, 0 elsewhere). The group admin still sees everything; moving staff between a group's own homes stays outside Merge (decision 10).`,
+    evidence: `${org.name} (${org.sites.length} sites) invited a manager limited to ${home.name} by email; after accepting, their rota showed ${rows.length} shift(s), all at that site (the group's ${other.name} draft was hidden), POST /shifts for ${other.name} was refused (403) while their own site's was accepted (201), and GET /workers listed only staff based at ${home.name} or unassigned (${listOf(staff).length} rows, 0 elsewhere). The group admin still sees everything; moving staff between a group's own homes stays outside Merge (decision 10).`,
     impact: 'Groups can delegate to home managers without sharing one login or splitting into separate organisations.',
     proposal: 'Keep: ORG_MANAGER scoped to one or more sites; group-level admins see everything.',
   });
@@ -634,7 +634,7 @@ async function addWorkers(ctx: SimContext, org: SimOrg, count: number, opts: { l
   if (unverifiedBacklog > 0) {
     // The compliance officer looks for what the sheet or the manager left unverified and clears it in one go.
     const queue = await api.task('Review verification queue', 'compliance officer', () => api.get(`/api/v1/compliance/verification-queue?orgId=${org.id}`, org.adminToken));
-    const ids = queue.status === 200 ? ((queue.body as any[]) ?? []).map((d) => d.document?.id ?? d.id).filter(Boolean) : [];
+    const ids = queue.status === 200 ? listOf(queue).map((d) => d.document?.id ?? d.id).filter(Boolean) : [];
     let verifyCalls = 0;
     let verified = 0;
     if (queue.status === 200) {
@@ -809,7 +809,7 @@ export async function supplierCheck(ctx: SimContext, org: SimOrg): Promise<void>
     stats.apiError(board.status, 'GET /shifts?scope=available');
     return;
   }
-  const open = (board.body as any[]).filter((s) => s.access.open && s.myAssignments.length === 0 && s.placesLeft > 0);
+  const open = listOf(board).filter((s) => s.access.open && s.myAssignments.length === 0 && s.placesLeft > 0);
   if (open.length === 0) return;
   const hasSurplus = Object.keys(org.activeSurplusFlag).length > 0;
   let responded = 0;
@@ -847,11 +847,11 @@ export async function supplierCheck(ctx: SimContext, org: SimOrg): Promise<void>
     // A busy board: the manager narrows it to what is near and sorts by distance (widening once when nothing is close).
     let radius = 30;
     let near = await api.task('Sort the board by distance', 'rota manager', () => api.get(`/api/v1/shifts?scope=available&sort=distance&nearKm=${radius}`, org.managerToken));
-    if (near.status === 200 && ((near.body as any[]) ?? []).length === 0) {
+    if (near.status === 200 && listOf(near).length === 0) {
       radius = 60;
       near = await api.task('Sort the board by distance', 'rota manager', () => api.get(`/api/v1/shifts?scope=available&sort=distance&nearKm=${radius}`, org.managerToken));
     }
-    const rows = near.status === 200 ? ((near.body as any[]) ?? []) : [];
+    const rows = near.status === 200 ? listOf(near) : [];
     const withDistance = rows.filter((r) => typeof r.distanceKm === 'number');
     if (near.status === 200 && rows.length > 0 && withDistance.length === rows.length) {
       api.countTask('Sort the board by distance');
@@ -893,7 +893,7 @@ export async function workerCheck(ctx: SimContext, org: SimOrg): Promise<void> {
     const board = await api.task('Worker browses shifts', 'care worker', () => api.get('/api/v1/shifts?scope=available', w.token));
     api.countTask('Worker browses shifts');
     if (board.status !== 200) continue;
-    const open = (board.body as any[]).filter((s) => s.access.open && s.myAssignments.length === 0 && s.placesLeft > 0);
+    const open = listOf(board).filter((s) => s.access.open && s.myAssignments.length === 0 && s.placesLeft > 0);
     if (open.length === 0 || !rng.chance(0.5)) continue;
     const shift = rng.pick(open);
     // The board marks each row "you can take this" or "not eligible"; nobody presses Request on the latter.
@@ -917,7 +917,7 @@ export async function hostCheck(ctx: SimContext, org: SimOrg): Promise<void> {
   const incoming = await api.task('Review incoming requests', 'rota manager', () => api.get('/api/v1/assignments?scope=incoming&status=REQUESTED', org.managerToken));
   api.countTask('Review incoming requests');
   if (incoming.status !== 200) return;
-  const requests = incoming.body as any[];
+  const requests = listOf(incoming);
   // First come, first served per shift, confirmed in one action.
   const chosen: string[] = [];
   const seen = new Map<string, number>();
@@ -1002,7 +1002,7 @@ export async function hostCheck(ctx: SimContext, org: SimOrg): Promise<void> {
   // Accept offers made to us (as a supplier).
   const offers = await api.task('Review offers received', 'rota manager', () => api.get('/api/v1/assignments?scope=outgoing&status=OFFERED', org.managerToken));
   api.countTask('Review offers received');
-  for (const o of (offers.body as any[]) ?? []) {
+  for (const o of listOf(offers)) {
     if (!rng.chance(0.8)) continue;
     const res = await api.task('Accept a direct offer', 'rota manager', () => api.post(`/api/v1/assignments/${o.id}/accept`, org.managerToken));
     api.countTask('Accept a direct offer');
@@ -1029,12 +1029,12 @@ export async function hostDirectOffers(ctx: SimContext, org: SimOrg): Promise<vo
   if (!rng.chance(0.15)) return;
   const posted = await api.task('Review my posted shifts', 'rota manager', () => api.get('/api/v1/shifts?scope=posted&status=OPEN', org.managerToken));
   api.countTask('Review my posted shifts');
-  const open = ((posted.body as any[]) ?? []).filter((s) => s.pendingRequests === 0 && new Date(s.startsAt).getTime() - clock.now.getTime() < 3 * DAY);
+  const open = listOf(posted).filter((s) => s.pendingRequests === 0 && new Date(s.startsAt).getTime() - clock.now.getTime() < 3 * DAY);
   if (open.length === 0) return;
   const shift = rng.pick(open);
   const cands = await api.task('Search candidates for a shift', 'rota manager', () => api.get(`/api/v1/shifts/${shift.id}/candidates`, org.managerToken));
   api.countTask('Search candidates for a shift');
-  const list = (cands.body as any[]) ?? [];
+  const list = listOf(cands);
   if (list.length === 0) return;
   const chosen = list[0];
   await api.task('Offer a shift to a named worker', 'rota manager', () => api.post(`/api/v1/shifts/${shift.id}/offers`, org.managerToken, { workerId: chosen.id }));
@@ -1046,7 +1046,7 @@ export async function cancellations(ctx: SimContext, org: SimOrg): Promise<void>
   const { api, rng, clock, stats } = ctx;
   const supplied = await api.task('Review upcoming bookings', 'rota manager', () => api.get('/api/v1/assignments?scope=outgoing&status=CONFIRMED', org.managerToken));
   api.countTask('Review upcoming bookings');
-  for (const a of (supplied.body as any[]) ?? []) {
+  for (const a of listOf(supplied)) {
     const hoursToStart = (new Date(a.shift.startsAt).getTime() - clock.now.getTime()) / HOUR;
     if (hoursToStart <= 0 || hoursToStart > 72) continue;
     const pCancel = (1 - org.reliability) * 0.45; // per daily check inside the 72h window
@@ -1058,7 +1058,7 @@ export async function cancellations(ctx: SimContext, org: SimOrg): Promise<void>
   if (rng.chance(0.25)) {
     const posted = await api.task('Review my posted shifts', 'rota manager', () => api.get('/api/v1/shifts?scope=posted', org.managerToken));
     api.countTask('Review my posted shifts');
-    for (const s of (posted.body as any[]) ?? []) {
+    for (const s of listOf(posted)) {
       if (!['OPEN', 'FILLED'].includes(s.status) || !rng.chance(0.004)) continue;
       const res = await api.task('Cancel a shift', 'rota manager', () => api.post(`/api/v1/shifts/${s.id}/cancel`, org.managerToken, { reason: 'Resident discharged' }));
       api.countTask('Cancel a shift');
@@ -1073,7 +1073,7 @@ export async function afterShifts(ctx: SimContext, org: SimOrg): Promise<void> {
   const receivable = await api.task('Review timesheets to submit', 'rota manager', () => api.get('/api/v1/timesheets?scope=receivable&status=DRAFT', org.managerToken));
   api.countTask('Review timesheets to submit');
   let submitted = 0;
-  for (const ts of (receivable.body as any[]) ?? []) {
+  for (const ts of listOf(receivable)) {
     const end = new Date(ts.shift.endsAt).getTime();
     const start = new Date(ts.shift.startsAt).getTime();
     if (start > clock.now.getTime()) continue;
@@ -1103,7 +1103,7 @@ export async function afterShifts(ctx: SimContext, org: SimOrg): Promise<void> {
   if (rng.chance(0.85)) {
     const incoming = await api.task('Check who is due on shift', 'rota manager', () => api.get('/api/v1/assignments?scope=incoming&status=CONFIRMED', org.managerToken));
     api.countTask('Check who is due on shift');
-    for (const a of (incoming.body as any[]) ?? []) {
+    for (const a of listOf(incoming)) {
       const start = new Date(a.shift.startsAt).getTime();
       if (start > clock.now.getTime() || clock.now.getTime() - start > 4 * HOUR) continue;
       const supplier = ctx.world.org(a.supplierOrgId);
@@ -1153,7 +1153,7 @@ export async function hostApprovals(ctx: SimContext, org: SimOrg): Promise<void>
   if (!rng.chance(org.responsiveness * 0.7)) return;
   const payable = await api.task('Review submitted timesheets', 'finance clerk', () => api.get('/api/v1/timesheets?scope=payable&status=SUBMITTED', org.managerToken));
   api.countTask('Review submitted timesheets');
-  const rows = (payable.body as any[]) ?? [];
+  const rows = listOf(payable);
   let toApprove: any[] = [];
   const toDispute: any[] = [];
   for (const ts of rows) {
@@ -1217,7 +1217,7 @@ export async function resolveDisputes(ctx: SimContext, org: SimOrg): Promise<voi
   if (!rng.chance(0.5)) return;
   const disputed = await api.task('Review disputed timesheets', 'rota manager', () => api.get('/api/v1/timesheets?scope=receivable&status=DISPUTED', org.managerToken));
   api.countTask('Review disputed timesheets');
-  for (const ts of (disputed.body as any[]) ?? []) {
+  for (const ts of listOf(disputed)) {
     const start = new Date(ts.shift.startsAt).getTime();
     const end = new Date(ts.shift.endsAt).getTime();
     await api.task('Correct a disputed timesheet', 'rota manager', () => api.post(`/api/v1/timesheets/${ts.id}/submit`, org.managerToken, { clockInAt: iso(new Date(start)), clockOutAt: iso(new Date(end - rng.int(0, 30) * 60_000)), breakMinutes: ts.breakMinutes, notes: 'Corrected after dispute' }));
@@ -1270,7 +1270,7 @@ export async function manageFlags(ctx: SimContext, org: SimOrg, week: number): P
   // Flags fulfilled or expired server-side: refresh our view.
   const mine = await api.task('Check my capacity flags', 'rota manager', () => api.get('/api/v1/capacity/flags?status=ACTIVE&kind=SURPLUS', org.managerToken));
   api.countTask('Check my capacity flags');
-  const activeIds = new Set(((mine.body as any[]) ?? []).map((f) => f.id));
+  const activeIds = new Set(listOf(mine).map((f) => f.id));
   for (const g of groups) if (org.activeSurplusFlag[g] && !activeIds.has(org.activeSurplusFlag[g])) delete org.activeSurplusFlag[g];
   if (week > 2 && Object.keys(org.activeSurplusFlag).length === 0 && groups.some((g) => org.balance[g] >= 2) && !gaps.gaps.has('DSP-03')) {
     // Was the manager told when the flag ran out, or did it lapse silently? Only meaningful once a flag has actually expired.
@@ -1278,7 +1278,7 @@ export async function manageFlags(ctx: SimContext, org: SimOrg, week: number): P
     api.countTask('Check notifications');
     const expired = ((inbox.body?.notifications as any[]) ?? []).filter((n) => n.type === 'FLAG_EXPIRED');
     const flags = await api.task('Check my capacity flags', 'rota manager', () => api.get('/api/v1/capacity/flags?kind=SURPLUS&status=EXPIRED', org.managerToken));
-    const lapsed = ((flags.body as any[]) ?? []).length;
+    const lapsed = listOf(flags).length;
     if (expired.length === 0 && lapsed === 0) {
       /* nothing has lapsed yet; look again next week */
     } else if (expired.length > 0) {
@@ -1319,7 +1319,7 @@ export async function complianceRound(ctx: SimContext, org: SimOrg): Promise<voi
   if (list.status !== 200) return;
   let blocked = 0;
   let renewed = 0;
-  for (const w of list.body as any[]) {
+  for (const w of listOf(list)) {
     if (w.status !== 'ACTIVE') continue;
     const items = (w.compliance?.items ?? []) as Array<{ type: DocumentType; status: string }>;
     if (w.compliance?.status === 'NON_COMPLIANT') blocked++;
@@ -1391,7 +1391,7 @@ export async function monthEnd(ctx: SimContext, periodStart: Date, periodEnd: Da
     world.features.settlement = false;
     run = await api.task('Generate monthly statements', 'agency finance', () => api.post('/api/v1/invoices/generate', world.platformAdminToken, { periodStart: iso(periodStart), periodEnd: iso(periodEnd) }));
     api.countTask('Generate monthly statements');
-    created = (run.body as any[]) ?? [];
+    created = listOf(run);
     for (const inv of created) {
       const host = world.org(inv.hostOrgId);
       pendingPayments.push({ invoiceId: inv.id, hostOrgId: inv.hostOrgId, dueAt: new Date(clock.now.getTime() + (host?.payLagDays ?? 30) * DAY), kind: 'pair' });
@@ -1413,7 +1413,7 @@ export async function monthEnd(ctx: SimContext, periodStart: Date, periodEnd: Da
     runTotals.remittanceValue += remittances.reduce((s, i) => s + (i.total ?? 0), 0);
     // Who is on credit hold this morning: the agency's finance team reads it off the directory.
     const directory = await api.task('Review credit holds', 'agency finance', () => api.get('/api/v1/organisations', world.platformAdminToken));
-    const onHold = ((directory.body as any[]) ?? []).filter((o) => o.creditHold === true).map((o) => o.name);
+    const onHold = listOf(directory).filter((o) => o.creditHold === true).map((o) => o.name);
     gaps.record({
       id: 'FIN-01',
       title: 'Settlement: hosts are invoiced by the platform, suppliers get remittances, payments and reminders are tracked',
@@ -1548,7 +1548,7 @@ export async function importWorkers(ctx: SimContext, org: SimOrg, count: number,
   const queue = await api.task('Review verification queue', 'compliance officer', () => api.get('/api/v1/compliance/verification-queue', org.adminToken));
   if (queue.status === 200) {
     api.countTask('Review verification queue');
-    const ids = ((queue.body as any[]) ?? []).map((d) => d.document?.id ?? d.id).filter(Boolean);
+    const ids = listOf(queue).map((d) => d.document?.id ?? d.id).filter(Boolean);
     for (let i = 0; i < ids.length; i += 200) {
       await api.task('Verify documents in bulk', 'compliance officer', () => api.post('/api/v1/compliance/verify', org.adminToken, { documentIds: ids.slice(i, i + 200) }));
       api.countTask('Verify documents in bulk');
@@ -1556,7 +1556,7 @@ export async function importWorkers(ctx: SimContext, org: SimOrg, count: number,
   }
   // Load what was created so the rest of the simulation can use it.
   const list = await api.get('/api/v1/workers', org.adminToken);
-  for (const w of (list.body as any[]) ?? []) {
+  for (const w of listOf(list)) {
     const group = GROUP_OF_ROLE[w.jobRole as JobRole];
     org.workers.push({ id: w.id, orgId: org.id, name: `${w.firstName} ${w.lastName}`, jobRole: w.jobRole, group, skills: w.skills ?? [], shareable: !!w.shareable, token: null, email: w.email ?? null, contractedHours: w.contractedHoursPerWeek ?? 0, active: w.status === 'ACTIVE' });
   }
