@@ -43,11 +43,12 @@ export function evaluateWorkerForShift(
   // Corrected documents stay as history (supersededAt set) and must not count towards compliance.
   const documents = db.select().from(workerDocuments).where(and(eq(workerDocuments.workerId, worker.id), isNull(workerDocuments.supersededAt))).all();
   // Decision 7: only firm bookings count as booked time; requests and offers elsewhere are soft holds (warned below).
+  // Shifts already worked this week (COMPLETED) still count towards the 48-hour and rest checks.
   const booked = db
     .select({ startsAt: shifts.startsAt, endsAt: shifts.endsAt, breakMinutes: shifts.breakMinutes })
     .from(shiftAssignments)
     .innerJoin(shifts, eq(shifts.id, shiftAssignments.shiftId))
-    .where(and(eq(shiftAssignments.workerId, worker.id), eq(shiftAssignments.status, 'CONFIRMED'), ne(shiftAssignments.shiftId, shift.id)))
+    .where(and(eq(shiftAssignments.workerId, worker.id), inArray(shiftAssignments.status, ['CONFIRMED', 'COMPLETED']), ne(shiftAssignments.shiftId, shift.id)))
     .all();
   const pendingElsewhere = db
     .select({ status: shiftAssignments.status, title: shifts.title, startsAt: shifts.startsAt })

@@ -441,8 +441,10 @@ describe('review regressions', () => {
   it('closes pending requests when a shift starts and blocks break edits after confirmations', async () => {
     const res = await api.post('/api/v1/shifts').set(auth(oakwood.token)).send({ siteId: oakSite.id, jobRole: 'CARE_ASSISTANT', title: 'Starts soon', startsAt: addHours(clock, 2).toISOString(), endsAt: addHours(clock, 10).toISOString(), breakMinutes: 30, headcount: 2, chargeRate: 18, publish: true });
     expect(res.body.urgent).toBe(true);
-    const a = await api.post(`/api/v1/shifts/${res.body.id}/requests`).set(auth(riverside.token)).send({ workerId: rivWorker.id });
-    expect(a.status).toBe(201);
+    // A rested worker: shifts already worked this week count towards rest and hours, so the usual fixture is no longer free.
+    const rested = await addWorker(riverside, 'Rested', 'CARE_ASSISTANT');
+    const a = await api.post(`/api/v1/shifts/${res.body.id}/requests`).set(auth(riverside.token)).send({ workerId: rested.id });
+    expect(a.status, JSON.stringify(a.body)).toBe(201);
     const confirm = await api.post(`/api/v1/assignments/${a.body.assignment.id}/confirm`).set(auth(oakwood.token));
     expect(confirm.body.status).toBe('CONFIRMED');
     expect((await api.patch(`/api/v1/shifts/${res.body.id}`).set(auth(oakwood.token)).send({ breakMinutes: 60 })).status).toBe(409);

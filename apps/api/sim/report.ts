@@ -191,7 +191,7 @@ ${monthRows}
 
 ## What the numbers say
 
-${observations(r.weeks, r.providers, r.escalation).map((o) => `- **${o.title}.** ${o.detail}`).join('\n')}
+${observations(r.weeks, r.providers, r.escalation, new Set((r.gaps as Array<{ id: string; status?: string }>).filter((g) => g.status === 'fixed').map((g) => g.id))).map((o) => `- **${o.title}.** ${o.detail}`).join('\n')}
 
 ## Ease of use: how many calls each task needed
 

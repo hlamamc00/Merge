@@ -58,7 +58,7 @@ export interface EscalationOutcome {
 }
 
 /** Plain-language readings of the numbers, for the report. */
-export function observations(weeks: WeekStats[], providers: Array<{ name: string; status: string }>, escalation?: EscalationOutcome | null): Observation[] {
+export function observations(weeks: WeekStats[], providers: Array<{ name: string; status: string }>, escalation?: EscalationOutcome | null, fixedIds: Set<string> = new Set()): Observation[] {
   const out: Observation[] = [];
   const posted = sum(weeks.map((w) => w.shiftsPosted));
   const expired = sum(weeks.map((w) => w.shiftsExpiredUnfilled));
@@ -96,7 +96,14 @@ export function observations(weeks: WeekStats[], providers: Array<{ name: string
     });
   }
   const left = providers.filter((p) => p.status !== 'ACTIVE').map((p) => p.name);
-  if (left.length) out.push({ title: `${left.length} organisation(s) ended the run suspended or gone`, detail: `${left.join(', ')}. Their open shifts, bookings and statements were left for people to sort out by hand; see PLT-01 and PLT-02.` });
+  if (left.length) {
+    out.push({
+      title: `${left.length} organisation(s) ended the run suspended or gone`,
+      detail: fixedIds.has('PLT-01')
+        ? `${left.join(', ')}. Suspension withdrew their open shifts and told the hosts holding their staff (PLT-01); confirmed bookings of their staff elsewhere were honoured pending the owner's decision, and leaving the network is still a request to the agency with no final statement or data export (PLT-02).`
+        : `${left.join(', ')}. Their open shifts, bookings and statements were left for people to sort out by hand; see PLT-01 and PLT-02.`,
+    });
+  }
   const notif = sum(weeks.map((w) => w.notificationsSent));
   const emails = sum(weeks.map((w) => w.emailsSent ?? 0));
   const peakWeek = weeks.reduce((a, b) => (b.notificationsSent > a.notificationsSent ? b : a));

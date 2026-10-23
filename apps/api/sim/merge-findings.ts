@@ -84,6 +84,22 @@ for (const g of result.gaps as Gap[]) {
   else if (extensions[g.id] && !g.evidence.includes(extensions[g.id]!)) g.evidence += extensions[g.id]; // idempotent on re-runs
 }
 (result as { fixed?: Record<string, string> }).fixed = FIXED;
+/**
+ * Findings whose substance was built but which keep an open decision: the register would otherwise
+ * repeat a title that is no longer true. Evidence extensions (persona-extensions.json) say what exists.
+ */
+const RETITLE: Record<string, { title: string; severity?: GapSeverity }> = {
+  'PC-01': { title: 'Safeguarding concerns about a lent worker are recorded and routed to the employer and the platform; who else may see them and whether the platform mediates is undecided', severity: 'medium' },
+  'PC-02': { title: 'The shareable toggle is still a reasonless hold with no end date, although host bars and leaver handling now release bookings', severity: 'medium' },
+  'PF-04': { title: 'Accounting export has no VAT treatment, nominal codes, payee details or due dates (CSV of invoices, remittances and lines exists)' },
+};
+for (const g of result.gaps as Gap[]) {
+  const r = RETITLE[g.id];
+  if (r && g.status !== 'fixed') {
+    g.title = r.title;
+    if (r.severity) g.severity = r.severity;
+  }
+}
 const order: Record<GapSeverity, number> = { blocker: 0, high: 1, medium: 2, low: 3 };
 (result.gaps as Gap[]).sort((a, b) => order[a.severity] - order[b.severity] || a.category.localeCompare(b.category) || a.id.localeCompare(b.id));
 writeFileSync(resolve(dir, 'result.json'), JSON.stringify(result, null, 1));
