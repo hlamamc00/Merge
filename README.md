@@ -23,14 +23,15 @@
 
 | Area | Highlights |
 | --- | --- |
-| **Organisations** | Agency (platform owner) and provider organisations, sites, users with four roles, preferred-partner and block lists, directory. |
-| **Workers** | Profiles, roles with a cover matrix (a nurse may cover a senior-carer shift, not vice versa), skills, shareable flag, compliance documents with verification and expiry, unavailability, optional self-service login. |
-| **Capacity flags** | `SURPLUS` ("our staff are short of hours") → priority access to matching shifts, consumed as hours are booked. `SHORTAGE` ("we will be posting") → visible demand. Network supply/demand view. |
-| **Shifts & dispatch** | Post, preview *who will see it and when*, publish with a persisted staged release plan, urgent collapse, visibility modes (network / priority-only / preferred-only / agency-only), direct offers to named workers, candidate search. |
-| **Eligibility** | Explained, not just enforced: role, skills, compliance *as of the shift date*, access window, overlaps, 11 h rest, weekly hours cap with 48 h opt-out override, travel distance, breaks. |
-| **Bookings** | Request / offer / confirm / decline / withdraw / cancel (late-cancellation tracking) / no-show; auto-confirm; automatic decline of the rest when a shift fills. |
-| **Timesheets & money** | Clock in/out (with location), submit, dispute, approve; host cost, platform fee and supplier amount per timesheet; statements per host/supplier pair; ratings both ways. |
-| **Operations** | In-app notifications with pluggable channels, background scheduler (opens tiers, expires flags, starts/completes/expires shifts, unfilled warnings, document-expiry alerts), audit log, admin settings and overview. |
+| **Organisations** | Agency (platform owner) and provider organisations register with their regulator number, accept the MOU and are approved by the platform; sites; users with four roles, managers optionally limited to sites; authenticator two-factor, lockout and forced password change; preferred-partner and block lists; directory. |
+| **Workers** | Profiles, roles with a cover matrix (a nurse may cover a senior-carer shift, not vice versa), skills, shareable flag, spreadsheet import with email invitations, compliance documents with files, verification queue, versioning and expiry, host-specific requirements, worker self-upload, actual hours per week, unavailability, data export and erasure. |
+| **Capacity flags** | `SURPLUS` ("our staff are short of hours") → priority access to matching shifts, consumed as hours are booked; the flag names the staff it frees so their contracted hours stop counting against the 48-hour limit; expiry nudges. `SHORTAGE` ("we will be posting") → visible demand. Network supply/demand view. |
+| **Shifts & dispatch** | Post (above a platform-wide floor rate), repeat weekly or copy, preview *who will see it and when*, publish with a persisted staged release plan, urgent collapse, automatic or manual escalation of unfilled shifts (rate steps up to a ceiling, widened reach), board sorted by distance, rate or start with per-worker eligibility, direct offers, candidate search, bulk confirm. |
+| **Eligibility** | Explained, not just enforced: role, skills, compliance *as of the shift date*, host requirements and bars, access window, overlaps, 11 h rest, 48 h week counting contracted hours unless the employer records otherwise (opt-out override), travel distance, breaks; re-checked when a request is confirmed. |
+| **Bookings** | Request / offer / confirm / decline / withdraw / cancel (late-cancellation tracking) / no-show; requests are soft holds until confirmed; auto-confirm; automatic decline of the rest when a shift fills; leavers' future bookings released. |
+| **Trust & safety** | Reliability record per organisation and worker, host bars on individual workers, reports (attendance, conduct, safeguarding) routed to the employer, priority penalty and suspension for repeated no-shows. |
+| **Timesheets & money** | Clock in/out (with location), submit, dispute, approve or bulk-approve with exceptions highlighted, auto-approval after 14 days; host invoices and supplier remittances each month (hosts pay the platform, the platform pays suppliers), credits, overdue reminders and credit hold, CSV exports, spend and earnings reports, agency P&L and bank utilisation, per-site workforce report for inspections; ratings both ways. |
+| **Operations** | Notifications in-app and by email (immediate or daily digest, quiet hours, per-user preferences), background scheduler (opens tiers, escalates, expires flags, starts/completes/expires shifts, reminders, finance jobs, document-expiry alerts, retention purge), audit log, admin settings and overview. |
 
 See **[docs/FEATURE-ROADMAP.md](docs/FEATURE-ROADMAP.md)** for the recommended next features.
 
@@ -78,7 +79,7 @@ npm run build
 npm run db:reset && npm run db:migrate && npm run db:seed   # start over
 ```
 
-Configuration lives in `apps/api/.env.example` (database path, port, JWT secret, CORS origins, scheduler interval).
+Configuration lives in `apps/api/.env.example` (database path, port, JWT secret, CORS origins, scheduler interval, `WEB_URL` for emailed links, `SMTP_URL`/`MAIL_FROM` for email delivery, file storage directory). Without `SMTP_URL`, emails are printed to the API console.
 
 ### Docker
 
