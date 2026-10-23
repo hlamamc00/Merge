@@ -1,14 +1,18 @@
 import request from 'supertest';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { addDays, addHours, addMinutes, requiredDocumentsForRole, type JobRole } from '@merge/shared';
+import { eq } from 'drizzle-orm';
 import { createApp } from '../src/app.js';
 import { openDatabase, runMigrations } from '../src/db/client.js';
+import { platformSettings } from '../src/db/schema.js';
 
 const T0 = new Date('2026-11-02T08:00:00Z');
 let clock = T0;
 const { db } = openDatabase(':memory:');
 runMigrations(db);
 const { app } = createApp({ db, now: () => clock, channels: [] });
+// Two-factor enrolment is covered by compliance-security.test.ts; this suite exercises the rest of the platform without it.
+db.update(platformSettings).set({ twoFactorRequiredForManagers: false }).where(eq(platformSettings.id, 'default')).run();
 
 type Api = ReturnType<typeof request>;
 const api: Api = request(app);

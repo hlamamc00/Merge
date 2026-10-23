@@ -1,7 +1,7 @@
 import { useState, type FormEvent } from 'react';
 import { Link, Navigate, useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from '../auth/AuthContext';
-import { Button, ErrorBanner, Field, Input } from '../components/ui';
+import { Button, ErrorBanner, Field, InfoBanner, Input } from '../components/ui';
 
 const DEMO = [
   ['admin@merge.local', 'Platform admin (Merge Staffing agency)'],
@@ -13,9 +13,11 @@ const DEMO = [
 ];
 
 export function LoginPage() {
-  const { login, me, loading } = useAuth();
+  const { login, verifyTwoFactor, me, loading } = useAuth();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [challenge, setChallenge] = useState<string | null>(null);
+  const [code, setCode] = useState('');
   const [error, setError] = useState<unknown>(null);
   const [busy, setBusy] = useState(false);
   const navigate = useNavigate();
@@ -29,7 +31,11 @@ export function LoginPage() {
     setBusy(true);
     setError(null);
     try {
-      await login(email, password);
+      const result = await login(email, password);
+      if (result.challengeToken) {
+        setChallenge(result.challengeToken);
+        return;
+      }
       navigate(from, { replace: true });
     } catch (err) {
       setError(err);
@@ -37,6 +43,41 @@ export function LoginPage() {
       setBusy(false);
     }
   };
+
+  const submitCode = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!challenge) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await verifyTwoFactor(challenge, code);
+      navigate(from, { replace: true });
+    } catch (err) {
+      setError(err);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (challenge) {
+    return (
+      <AuthShell title="Enter your authenticator code" subtitle="Open your authenticator app and type the six-digit code for Merge.">
+        <form onSubmit={submitCode} className="space-y-4">
+          <ErrorBanner error={error} />
+          <Field label="Six-digit code" required>
+            <Input inputMode="numeric" autoComplete="one-time-code" pattern="[0-9 ]*" maxLength={7} autoFocus value={code} onChange={(e) => setCode(e.target.value)} required className="text-center font-mono text-lg tracking-[0.4em]" />
+          </Field>
+          <Button type="submit" className="w-full" loading={busy}>
+            Verify and sign in
+          </Button>
+          <p className="text-center text-xs text-slate-500">
+            <button type="button" className="font-medium text-brand-700 hover:underline" onClick={() => { setChallenge(null); setCode(''); setError(null); }}>Start again</button>
+            {' · '}Lost your phone? Ask your organisation's administrator to reset your authenticator.
+          </p>
+        </form>
+      </AuthShell>
+    );
+  }
 
   return (
     <AuthShell title="Sign in to Merge" subtitle="Lend and borrow care staff across your network.">
@@ -51,11 +92,13 @@ export function LoginPage() {
         <Button type="submit" className="w-full" loading={busy}>
           Sign in
         </Button>
-        <p className="text-center text-xs text-slate-500">
-          New care provider? <Link to="/register" className="font-medium text-brand-700 hover:underline">Join the network</Link>
+        <p className="flex items-center justify-between text-xs text-slate-500">
+          <Link to="/forgot-password" className="font-medium text-brand-700 hover:underline">Forgotten your password?</Link>
+          <span>New care provider? <Link to="/register" className="font-medium text-brand-700 hover:underline">Join the network</Link></span>
         </p>
       </form>
-      <div className="mt-6 rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900">
+      <InfoBanner tone="slate" className="mt-5 text-xs">Managers and administrators sign in with a password and an authenticator app. You will be asked to set the app up the first time you sign in.</InfoBanner>
+      <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900">
         <div className="mb-1 font-semibold">Demo logins (password: <code>password123</code>)</div>
         <ul className="space-y-1">
           {DEMO.map(([e, d]) => (
@@ -72,10 +115,10 @@ export function LoginPage() {
   );
 }
 
-export function AuthShell({ title, subtitle, children }: { title: string; subtitle?: string; children: React.ReactNode }) {
+export function AuthShell({ title, subtitle, children, wide }: { title: string; subtitle?: string; children: React.ReactNode; wide?: boolean }) {
   return (
     <div className="flex min-h-full items-center justify-center bg-gradient-to-br from-brand-50 via-slate-50 to-slate-100 px-4 py-10">
-      <div className="w-full max-w-md">
+      <div className={`w-full ${wide ? 'max-w-2xl' : 'max-w-md'}`}>
         <div className="mb-6 flex items-center justify-center gap-2">
           <span className="grid h-10 w-10 place-items-center rounded-xl bg-brand-600 text-lg font-bold text-white">M</span>
           <span className="text-2xl font-semibold tracking-tight text-slate-900">Merge</span>

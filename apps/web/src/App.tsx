@@ -16,6 +16,7 @@ import { ResetPasswordPage } from './pages/ResetPasswordPage';
 import { ChangePasswordPage } from './pages/ChangePasswordPage';
 import { NotificationSettingsPage } from './pages/NotificationSettingsPage';
 import { TrustPage } from './pages/TrustPage';
+import { TwoFactorSetupPage } from './pages/TwoFactorSetupPage';
 import { CompliancePage } from './pages/CompliancePage';
 import { FinancePage } from './pages/FinancePage';
 import { AgencyFinancePage } from './pages/AgencyFinancePage';
@@ -31,10 +32,13 @@ import { WorkerDetailPage } from './pages/WorkerDetailPage';
 import { WorkersPage } from './pages/WorkersPage';
 
 function RequireAuth({ children, manager, admin, platform }: { children: JSX.Element; manager?: boolean; admin?: boolean; platform?: boolean }) {
-  const { me, loading, isManager, isAdmin, isPlatformAdmin } = useAuth();
+  const { me, loading, isManager, isAdmin, isPlatformAdmin, gate } = useAuth();
   const location = useLocation();
   if (loading) return <div className="p-8"><Loading /></div>;
   if (!me) return <Navigate to="/login" state={{ from: location }} replace />;
+  // Security gates (decision 16): a temporary password must be changed and managers must enrol an authenticator before anything else.
+  if (gate === 'PASSWORD' && location.pathname !== '/change-password') return <Navigate to="/change-password" replace />;
+  if (gate === 'TWO_FACTOR' && location.pathname !== '/setup-2fa') return <Navigate to="/setup-2fa" replace />;
   if (platform && !isPlatformAdmin) return <Navigate to="/" replace />;
   if (admin && !isAdmin) return <Navigate to="/" replace />;
   if (manager && !isManager) return <Navigate to="/" replace />;
@@ -49,6 +53,7 @@ export default function App() {
       <Route path="/invite/:token" element={<AcceptInvitePage />} />
       <Route path="/forgot-password" element={<ForgotPasswordPage />} />
       <Route path="/reset-password/:token" element={<ResetPasswordPage />} />
+      <Route path="/setup-2fa" element={<TwoFactorSetupPage />} />
       <Route
         element={
           <RequireAuth>
@@ -66,7 +71,7 @@ export default function App() {
         <Route path="/workers" element={<RequireAuth manager><WorkersPage /></RequireAuth>} />
         <Route path="/workers/import" element={<RequireAuth manager><ImportWorkersPage /></RequireAuth>} />
         <Route path="/workers/:id" element={<WorkerDetailPage />} />
-        <Route path="/compliance" element={<RequireAuth manager><CompliancePage /></RequireAuth>} />
+        <Route path="/compliance" element={<CompliancePage />} />
         <Route path="/trust" element={<RequireAuth manager><TrustPage /></RequireAuth>} />
         <Route path="/finance" element={<RequireAuth admin><FinancePage /></RequireAuth>} />
         <Route path="/admin/finance" element={<RequireAuth platform><AgencyFinancePage /></RequireAuth>} />

@@ -4,6 +4,7 @@ import { JOB_ROLE_LABELS } from '@merge/shared';
 import { api } from '../api/client';
 import { useAssignments, useAvailableShifts, useFlags, useNetworkCapacity, useOrgStats, useTimesheets } from '../api/hooks';
 import type { AdminOverview, SuppliedShift } from '../api/types';
+import type { ComplianceOverview } from '../api/types.compliance';
 import { useAuth } from '../auth/AuthContext';
 import { ShiftCard } from '../components/ShiftCard';
 import { StatusBadge } from '../components/badges';
@@ -84,6 +85,8 @@ function ManagerDashboard() {
         </Card>
       </div>
 
+      <ComplianceStrip />
+
       <Card title="Shifts open to you now" actions={<LinkButton to="/shifts" size="sm" variant="secondary">Shift board</LinkButton>}>
         {available.isLoading ? <Loading /> : openNow.length === 0 ? <EmptyState title="Nothing open right now" description="Shifts you have priority access to will appear here the moment they are published." /> : (
           <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
@@ -94,6 +97,25 @@ function ManagerDashboard() {
         )}
       </Card>
     </div>
+  );
+}
+
+/** Compliance at a glance for managers: what will stop workers being sent out. */
+function ComplianceStrip() {
+  const q = useQuery({ queryKey: ['compliance-summary'], queryFn: () => api.get<ComplianceOverview>('/compliance/summary') });
+  const c = q.data;
+  if (q.isError) return null;
+  return (
+    <Card title="Compliance" description="Workers can only be put forward with every required document valid and verified." actions={<LinkButton to="/compliance" size="sm" variant="secondary">Compliance centre</LinkButton>}>
+      {!c ? <Loading /> : (
+        <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+          <StatCard label="Expiring in 30 days" value={c.documents.expiringIn30Days} tone={c.documents.expiringIn30Days ? 'amber' : 'slate'} to="/compliance" />
+          <StatCard label="Expired" value={c.documents.expired} tone={c.documents.expired ? 'red' : 'slate'} to="/compliance" />
+          <StatCard label="Awaiting verification" value={c.documents.awaitingVerification} tone={c.documents.awaitingVerification ? 'blue' : 'slate'} to="/compliance" />
+          <StatCard label="Workers not compliant" value={c.workers.nonCompliant} hint={`${c.workers.compliant} of ${c.workers.total} fully compliant`} tone={c.workers.nonCompliant ? 'red' : 'green'} to="/workers?compliance=NON_COMPLIANT" />
+        </div>
+      )}
+    </Card>
   );
 }
 
@@ -232,6 +254,9 @@ function WorkerDashboard() {
     <div className="space-y-5">
       <PageHeader title={`Hello, ${me?.user.firstName}`} description={me?.worker ? `${JOB_ROLE_LABELS[me.worker.jobRole]} · ${me.organisation.name}` : me?.organisation.name} />
       {!selfService && <Card><p className="text-sm text-slate-600">Your employer assigns shifts on your behalf. You can see your bookings and timesheets here; contact your manager to be put forward for a shift.</p></Card>}
+      <Card title="My documents" description="Your checks and training certificates. Upload renewals before they expire so you stay eligible for shifts." actions={<LinkButton to="/compliance" size="sm" variant="secondary">Open</LinkButton>}>
+        <p className="text-sm text-slate-600">Your employer keeps your DBS, right to work, ID and training on file here. You can add a new certificate yourself; your manager verifies it.</p>
+      </Card>
       <Card title="My upcoming shifts" actions={<LinkButton to="/shifts/supplied" size="sm" variant="secondary">All</LinkButton>}>
         {supplied.isLoading ? <Loading /> : (supplied.data ?? []).length === 0 ? <EmptyState title="No shifts booked yet" /> : (
           <ul className="divide-y divide-slate-100">

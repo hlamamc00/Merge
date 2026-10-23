@@ -3,11 +3,22 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useState, t
 import { UserRole } from '@merge/shared';
 import { api, getToken, setToken } from '../api/client';
 import type { Me, Organisation, User } from '../api/types';
+import type { LoginResponse, SecurityState } from '../api/types.compliance';
+
+/** What the platform insists on before this user can do anything else. */
+export type SecurityGate = 'TWO_FACTOR' | 'PASSWORD' | null;
+
+export interface LoginResult {
+  /** Set when the password was right but an authenticator code is still needed. */
+  challengeToken?: string;
+}
 
 interface AuthState {
   me: Me | null;
   loading: boolean;
-  login: (email: string, password: string) => Promise<void>;
+  login: (email: string, password: string) => Promise<LoginResult>;
+  /** Second step of login for accounts with an authenticator app. */
+  verifyTwoFactor: (challengeToken: string, code: string) => Promise<void>;
   register: (payload: unknown) => Promise<void>;
   logout: () => void;
   refresh: () => Promise<void>;
@@ -17,12 +28,16 @@ interface AuthState {
   isWorker: boolean;
   user: User | null;
   organisation: Organisation | null;
+  gate: SecurityGate;
+  security: SecurityState | null;
 }
 
 const AuthContext = createContext<AuthState | null>(null);
 
+type MeWithSecurity = Me & { security?: SecurityState };
+
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const [me, setMe] = useState<Me | null>(null);
+  const [me, setMe] = useState<MeWithSecurity | null>(null);
   const [loading, setLoading] = useState<boolean>(!!getToken());
   const qc = useQueryClient();
 
@@ -33,7 +48,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       return;
     }
     try {
-      const data = await api.get<Me>('/auth/me');
+      const data = await api.get<MeWithSecurity>('/auth/me');
       setMe(data);
     } catch {
       setToken(null);
@@ -47,10 +62,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     void refresh();
   }, [refresh]);
 
-  const login = useCallback(
-    async (email: string, password: string) => {
-      const res = await api.post<{ token: string }>('/auth/login', { email, password });
-      setToken(res.token);
+  const startSession = useCallback(
+    async (token: string) => {
+      setToken(token);
       qc.clear();
       setLoading(true);
       await refresh();
@@ -58,15 +72,31 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     [qc, refresh],
   );
 
+  const login = useCallback(
+    async (email: string, password: string): Promise<LoginResult> => {
+      const res = await api.post<LoginResponse>('/auth/login', { email, password });
+      if (res.twoFactorRequired && res.challengeToken) return { challengeToken: res.challengeToken };
+      if (!res.token) throw new Error('Sign-in did not return a session');
+      await startSession(res.token);
+      return {};
+    },
+    [startSession],
+  );
+
+  const verifyTwoFactor = useCallback(
+    async (challengeToken: string, code: string) => {
+      const res = await api.post<{ token: string }>('/auth/2fa/verify', { challengeToken, code });
+      await startSession(res.token);
+    },
+    [startSession],
+  );
+
   const register = useCallback(
     async (payload: unknown) => {
       const res = await api.post<{ token: string }>('/auth/register', payload);
-      setToken(res.token);
-      qc.clear();
-      setLoading(true);
-      await refresh();
+      await startSession(res.token);
     },
-    [qc, refresh],
+    [startSession],
   );
 
   const logout = useCallback(() => {
@@ -77,10 +107,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const value = useMemo<AuthState>(() => {
     const role = me?.user.role;
+    const security = me?.security ?? null;
+    const gate: SecurityGate = security?.passwordChangeRequired ? 'PASSWORD' : security?.twoFactorSetupRequired ? 'TWO_FACTOR' : null;
     return {
       me,
       loading,
       login,
+      verifyTwoFactor,
       register,
       logout,
       refresh,
@@ -90,8 +123,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       isAdmin: role === UserRole.PLATFORM_ADMIN || role === UserRole.ORG_ADMIN,
       isManager: role === UserRole.PLATFORM_ADMIN || role === UserRole.ORG_ADMIN || role === UserRole.ORG_MANAGER,
       isWorker: role === UserRole.WORKER,
+      gate,
+      security,
     };
-  }, [me, loading, login, register, logout, refresh]);
+  }, [me, loading, login, verifyTwoFactor, register, logout, refresh]);
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }
