@@ -18,6 +18,7 @@ const EXPLAIN: Record<string, string> = {
   TIMESHEET_DISPUTED: 'A timesheet was disputed or rejected',
   DOCUMENT_EXPIRING: "A worker's document is about to expire",
   FLAG_FULFILLED: 'Your capacity flag has been fully matched',
+  FLAG_EXPIRED: 'Your surplus flag ran out without being re-raised',
   INVOICE_ISSUED: 'A statement has been issued',
   SYSTEM: 'Messages from the platform',
 };

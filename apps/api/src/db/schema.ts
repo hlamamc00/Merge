@@ -192,6 +192,8 @@ export const workers = sqliteTable(
     homeSiteId: text('home_site_id'),
     /** Decision 14 / data protection: consent to be shown to other organisations. */
     consentToShareAt: ts('consent_to_share_at'),
+    /** Decision 18: personal data erased (GDPR); the row stays so financial and safety records keep their links. */
+    erasedAt: ts('erased_at'),
     createdAt: ts('created_at').notNull(),
     updatedAt: ts('updated_at').notNull(),
   },

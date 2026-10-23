@@ -281,6 +281,8 @@ export const NotificationType = {
   TIMESHEET_DISPUTED: 'TIMESHEET_DISPUTED',
   DOCUMENT_EXPIRING: 'DOCUMENT_EXPIRING',
   FLAG_FULFILLED: 'FLAG_FULFILLED',
+  /** A surplus flag ran out without being withdrawn or fulfilled (DSP-03). */
+  FLAG_EXPIRED: 'FLAG_EXPIRED',
   INVOICE_ISSUED: 'INVOICE_ISSUED',
   SYSTEM: 'SYSTEM',
 } as const;

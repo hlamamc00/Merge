@@ -1,0 +1,1 @@
+ALTER TABLE `workers` ADD `erased_at` integer;

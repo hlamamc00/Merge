@@ -1,7 +1,8 @@
 import { and, eq, gt, inArray, isNull, lt, lte, ne, or } from 'drizzle-orm';
 import { AssignmentStatus, JOB_ROLE_LABELS, NotificationType, ShiftStatus, hoursBetween, shiftPaidHours } from '@merge/shared';
 import type { Db } from '../db/client.js';
-import { organisations, shiftAccess, shiftAssignments, shifts, workers, type PlatformSettingsRow, type Shift, type ShiftAssignment, type Site, type Worker } from '../db/schema.js';
+import { organisations, shiftAccess, shiftAssignments, shifts, sites, workers, type PlatformSettingsRow, type Shift, type ShiftAssignment, type Site, type Worker } from '../db/schema.js';
+import { audit } from '../lib/audit.js';
 import { conflict, unprocessable } from '../lib/errors.js';
 import { newId } from '../lib/ids.js';
 import type { Notifier } from '../lib/notify.js';
@@ -153,6 +154,7 @@ export function confirmAssignment(
     .where(and(eq(shiftAssignments.workerId, worker.id), eq(shiftAssignments.status, 'CONFIRMED'), ne(shiftAssignments.shiftId, shift.id), lt(shifts.startsAt, shift.endsAt), gt(shifts.endsAt, shift.startsAt)))
     .get();
   if (clash) throw conflict(`${workerName(worker)} is already confirmed on an overlapping shift (${clash.title})`);
+  assertStillEligible(db, notifier, settings, assignment, shift, worker, actor, now);
   const filledCount = shift.filledCount + 1;
   const nowFull = filledCount >= shift.headcount;
 
@@ -191,6 +193,35 @@ export function confirmAssignment(
     });
   }
   return getAssignment(db, assignment.id);
+}
+
+/** Access-window codes are ignored at confirmation: a pending request or offer already had access when it was made. */
+const ACCESS_CODES: string[] = ['ACCESS_NOT_OPEN', 'NO_ACCESS'];
+
+/**
+ * Requests and offers are soft holds, so the worker's position can change before the host answers
+ * (bookings confirmed elsewhere, a document expiring, a bar). Re-run eligibility with the same
+ * hours override the request carried; a blocked row is declined and the caller sees why.
+ */
+function assertStillEligible(db: Db, notifier: Notifier, settings: PlatformSettingsRow, assignment: ShiftAssignment, shift: Shift, worker: Worker, actor: Actor, now: Date): void {
+  const site = db.select().from(sites).where(eq(sites.id, shift.siteId)).get()!;
+  const { result } = evaluateWorkerForShift(db, settings, shift, site, worker, now, { allowHoursOverride: assignment.hoursOverride });
+  const blockers = result.blockers.filter((b) => !ACCESS_CODES.includes(b.code));
+  if (blockers.length === 0) return;
+  const messages = blockers.map((b) => b.message);
+  db.update(shiftAssignments)
+    .set({ status: AssignmentStatus.DECLINED, respondedByUserId: actor.userId, respondedAt: now, note: `No longer eligible at confirmation: ${messages[0]}`, updatedAt: now })
+    .where(eq(shiftAssignments.id, assignment.id))
+    .run();
+  notifier.send({
+    orgId: assignment.supplierOrgId,
+    type: NotificationType.SHIFT_DECLINED,
+    title: `No longer eligible: ${workerName(worker)} – ${shift.title}`,
+    body: `${workerName(worker)} could not be confirmed for ${shift.startsAt.toISOString()} because their position changed after the ${assignment.status === AssignmentStatus.OFFERED ? 'offer' : 'request'} was made: ${messages.join('; ')}.`,
+    data: { shiftId: shift.id, assignmentId: assignment.id, kind: 'no-longer-eligible', blockers },
+  });
+  audit(db, actor, { action: 'DECLINE', entityType: 'shift_assignment', entityId: assignment.id, data: { blockers, reason: 'NO_LONGER_ELIGIBLE' } }, now);
+  throw conflict(`${workerName(worker)} is no longer eligible: ${messages.join('; ')}`, { code: 'NO_LONGER_ELIGIBLE', blockers });
 }
 
 /** Withdraw a worker's other pending requests/offers that overlap a shift they have just been confirmed on. */

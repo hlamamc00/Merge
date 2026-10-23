@@ -6,7 +6,7 @@ import { organisations, ratings, shiftAssignments, shifts, sites, timesheets, wo
 import { auditFromReq } from '../lib/audit.js';
 import { MANAGERS, isManager, isPlatformAdmin, requireAuth, requireRole } from '../lib/auth.js';
 import { auth, deps } from '../lib/context.js';
-import { conflict, forbidden, h, notFound } from '../lib/errors.js';
+import { HttpError, conflict, forbidden, h, notFound } from '../lib/errors.js';
 import { newId } from '../lib/ids.js';
 import { parseBody, parseQuery } from '../lib/validate.js';
 import { cancelAssignment, confirmAssignment, declineAssignment, recordNoShow, withdrawRequest } from '../services/assignments.js';
@@ -79,7 +79,7 @@ assignmentsRouter.post(
     const { user, org, settings } = auth(req);
     const body = parseBody(req, z.object({ ids: z.array(z.string()).min(1).max(100), action: z.enum(['confirm', 'decline']), reason: z.string().max(500).nullable().optional() }));
     const at = now();
-    const results: Array<{ id: string; ok: boolean; status?: string; error?: string }> = [];
+    const results: Array<{ id: string; ok: boolean; status?: string; error?: string; details?: unknown }> = [];
     for (const id of body.ids) {
       try {
         const { assignment, shift, isHost } = load(req, id);
@@ -95,7 +95,8 @@ assignmentsRouter.post(
           results.push({ id, ok: true, status: updated.status });
         }
       } catch (err) {
-        results.push({ id, ok: false, error: err instanceof Error ? err.message : String(err) });
+        // Structured causes (e.g. NO_LONGER_ELIGIBLE with its blockers) travel with the row so the UI can explain.
+        results.push({ id, ok: false, error: err instanceof Error ? err.message : String(err), details: err instanceof HttpError ? err.details : undefined });
       }
     }
     res.json({ results });

@@ -11,6 +11,7 @@ import { ComplianceBadge, StatusBadge } from '../components/badges';
 import { Badge, Button, Card, Checkbox, DescriptionList, EmptyState, ErrorBanner, Field, InfoBanner, Input, Loading, Modal, PageHeader, Select, Table, Textarea } from '../components/ui';
 import { fmtBytes, openProtectedFile, uploadFile } from '../lib/files';
 import { fmtDate, fmtDateTime, fmtShiftWindow, fromLocalInput, toDateInput, toLocalInput } from '../lib/format';
+import { downloadCsv } from './FinancePage';
 
 type Detail = Omit<WorkerDetail, 'documents' | 'login'> & {
   homeSiteId?: string | null;
@@ -24,7 +25,7 @@ type Detail = Omit<WorkerDetail, 'documents' | 'login'> & {
 
 export function WorkerDetailPage() {
   const { id } = useParams();
-  const { isManager } = useAuth();
+  const { isManager, isAdmin } = useAuth();
   const q = useQuery({ queryKey: ['worker', id], queryFn: () => api.get<Detail>(`/workers/${id}`), enabled: !!id });
   const [edit, setEdit] = useState(false);
   const [addDoc, setAddDoc] = useState(false);
@@ -109,6 +110,8 @@ export function WorkerDetailPage() {
         </Card>
       )}
 
+      {canManage && <DataCard worker={w} canErase={isAdmin} />}
+
       <EditWorkerModal open={edit} onClose={() => setEdit(false)} worker={w} />
       <AddDocumentModal open={addDoc} onClose={() => setAddDoc(false)} workerId={w.id} canVerify={canManage} />
       <AddUnavailabilityModal open={addUnav} onClose={() => setAddUnav(false)} workerId={w.id} />
@@ -116,6 +119,27 @@ export function WorkerDetailPage() {
       <InviteModal open={invite} onClose={() => setInvite(false)} worker={w} onFallback={() => { setInvite(false); setLogin(true); }} />
       <DeclareRequirementModal open={declare} onClose={() => setDeclare(false)} worker={w} />
     </div>
+  );
+}
+
+/** Decision 18: subject access export, and erasure of a leaver's personal data (admins only). */
+function DataCard({ worker, canErase }: { worker: Detail; canErase: boolean }) {
+  const [dlError, setDlError] = useState<unknown>(null);
+  const erase = useAction((reason: string) => api.post(`/workers/${worker.id}/erase`, { reason }));
+  const askToErase = () => {
+    const reason = window.prompt("Erase this worker's personal data? Their name, contact details, documents and login go for good; timesheets, invoices, ratings and the audit trail are kept. Reason for the record:");
+    if (reason?.trim()) erase.mutate(reason.trim());
+  };
+  return (
+    <Card title="Data" description="Everything held about this worker, for a subject access request or when they leave.">
+      <ErrorBanner error={dlError ?? erase.error} className="mb-3" />
+      {worker.erasedAt && <InfoBanner tone="slate" className="mb-3">Personal data erased on {fmtDate(worker.erasedAt)}. Timesheets, invoices, rating scores and the audit trail were kept.</InfoBanner>}
+      <div className="flex flex-wrap items-center gap-2">
+        <Button variant="secondary" size="sm" onClick={() => downloadCsv(`/workers/${worker.id}/export?download=1`, `worker-${worker.id}.json`).catch(setDlError)}>Export data (JSON)</Button>
+        {canErase && !worker.erasedAt && worker.status === 'INACTIVE' && <Button variant="danger" size="sm" onClick={askToErase} loading={erase.isPending}>Erase personal data…</Button>}
+        {canErase && !worker.erasedAt && worker.status !== 'INACTIVE' && <span className="text-xs text-slate-500">Set the worker to inactive before erasing their personal data.</span>}
+      </div>
+    </Card>
   );
 }
 

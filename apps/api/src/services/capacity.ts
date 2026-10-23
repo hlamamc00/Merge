@@ -91,9 +91,22 @@ export function releaseHoursFromFlag(db: Db, flagId: string | null | undefined, 
     .run();
 }
 
-export function expireFlags(db: Db, now: Date): number {
-  const due = db.select({ id: capacityFlags.id }).from(capacityFlags).where(and(eq(capacityFlags.status, CapacityFlagStatus.ACTIVE), lt(capacityFlags.endsAt, now))).all();
-  for (const f of due) db.update(capacityFlags).set({ status: CapacityFlagStatus.EXPIRED, closedAt: now, updatedAt: now }).where(eq(capacityFlags.id, f.id)).run();
+const dateFmt = new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/London', day: 'numeric', month: 'short', year: 'numeric' });
+
+/** Close flags whose period has passed. DSP-03: a lapsed surplus flag silently costs first access, so the organisation is told. */
+export function expireFlags(db: Db, notifier: Notifier, now: Date): number {
+  const due = db.select().from(capacityFlags).where(and(eq(capacityFlags.status, CapacityFlagStatus.ACTIVE), lt(capacityFlags.endsAt, now))).all();
+  for (const f of due) {
+    db.update(capacityFlags).set({ status: CapacityFlagStatus.EXPIRED, closedAt: now, updatedAt: now }).where(eq(capacityFlags.id, f.id)).run();
+    if (f.kind !== CapacityFlagKind.SURPLUS) continue;
+    notifier.send({
+      orgId: f.orgId,
+      type: NotificationType.FLAG_EXPIRED,
+      title: 'Your surplus flag has expired',
+      body: `Your ${f.jobRole ? JOB_ROLE_LABELS[f.jobRole] : 'any role'} surplus flag ran out on ${dateFmt.format(f.endsAt)}. Raise it again from Capacity flags if you still have spare staff; without an active flag you no longer get first access.`,
+      data: { flagId: f.id, kind: f.kind, jobRole: f.jobRole },
+    });
+  }
   return due.length;
 }
 

@@ -1,16 +1,17 @@
+import { randomBytes } from 'node:crypto';
 import { Router, type NextFunction, type Request, type Response } from 'express';
-import { and, avg, desc, eq, gte, inArray } from 'drizzle-orm';
+import { and, avg, desc, eq, gt, gte, inArray } from 'drizzle-orm';
 import multer from 'multer';
 import { z } from 'zod';
 import { DocumentType, JobRole, Skill, UserRole, WorkerStatus, addDays, complianceSummary, startOfIsoWeek, timeZoneOffsetMs } from '@merge/shared';
-import { ratings, shiftAssignments, shifts, sites, users, workerDocuments, workerUnavailability, workers, type WorkerWeekHours } from '../db/schema.js';
+import { authTokens, notificationPreferences, organisations, ratings, shiftAssignments, shifts, sites, timesheets, users, workerBars, workerDocuments, workerReports, workerUnavailability, workerWeekHours, workers, type WorkerWeekHours } from '../db/schema.js';
 import { auditFromReq } from '../lib/audit.js';
-import { MANAGERS, allowedSiteIds, assertOrgAccess, hashPassword, isManager, isPlatformAdmin, isSiteScoped, requireAuth, requireRole } from '../lib/auth.js';
+import { ADMINS, MANAGERS, allowedSiteIds, assertOrgAccess, hashPassword, isManager, isPlatformAdmin, isSiteScoped, requireAuth, requireRole } from '../lib/auth.js';
 import { auth, deps } from '../lib/context.js';
 import { HttpError, badRequest, conflict, forbidden, h, notFound, unprocessable } from '../lib/errors.js';
 import { newId } from '../lib/ids.js';
 import { getStorage, newFileKey } from '../lib/storage.js';
-import { assertChanges, parseBody, parseQuery, zDate, zOptionalDate, zPostcode } from '../lib/validate.js';
+import { assertChanges, parseBody, parseQuery, zDate, zOptionalDate, zPostcode, zQueryBool } from '../lib/validate.js';
 import { cancelFutureBookingsForWorker } from '../services/assignments.js';
 import { ALLOWED_DOCUMENT_MIME_TYPES, MAX_DOCUMENT_BYTES, activeDocuments, hostRequirementsForWorker, publicDocument } from '../services/compliance.js';
 import { clearInternalHours, listWeekHours, setInternalHours, weekStartsBetween } from '../services/weekHours.js';
@@ -493,5 +494,131 @@ workersRouter.delete(
     const { worker } = loadWorker(req, req.params.id!);
     db.delete(workerUnavailability).where(and(eq(workerUnavailability.id, req.params.unavailabilityId!), eq(workerUnavailability.workerId, worker.id))).run();
     res.status(204).end();
+  }),
+);
+
+// ---------- Data-subject tooling (decision 18, SEC-01) ----------
+
+/**
+ * Everything the platform holds about one worker, for a subject access request or a leaver.
+ * The worker themselves, the employer's admins and unrestricted managers, and the platform admin.
+ */
+workersRouter.get(
+  '/:id/export',
+  h((req, res) => {
+    const { db, now } = deps(req);
+    const { worker, own, self } = loadWorker(req, req.params.id!);
+    if (!self && !(own && canSeePrivate(req, worker))) throw forbidden();
+    const q = parseQuery(req, z.object({ download: zQueryBool }));
+    const login = worker.userId ? db.select({ email: users.email, lastLoginAt: users.lastLoginAt, totpEnabledAt: users.totpEnabledAt }).from(users).where(eq(users.id, worker.userId)).get() : undefined;
+    const assignments = db
+      .select({ id: shiftAssignments.id, status: shiftAssignments.status, requestedAt: shiftAssignments.requestedAt, shiftId: shifts.id, title: shifts.title, hostOrgName: organisations.name, siteName: sites.name, startsAt: shifts.startsAt, endsAt: shifts.endsAt })
+      .from(shiftAssignments)
+      .innerJoin(shifts, eq(shifts.id, shiftAssignments.shiftId))
+      .innerJoin(sites, eq(sites.id, shifts.siteId))
+      .innerJoin(organisations, eq(organisations.id, shifts.hostOrgId))
+      .where(eq(shiftAssignments.workerId, worker.id))
+      .orderBy(shifts.startsAt)
+      .all();
+    const bars = db
+      .select({ hostName: organisations.name, siteId: workerBars.siteId, createdAt: workerBars.createdAt, liftedAt: workerBars.liftedAt })
+      .from(workerBars)
+      .innerJoin(organisations, eq(organisations.id, workerBars.hostOrgId))
+      .where(eq(workerBars.workerId, worker.id))
+      .all();
+    const bundle = {
+      exportedAt: now().toISOString(),
+      worker,
+      login: login ? { email: login.email, lastLoginAt: login.lastLoginAt, twoFactorEnabled: !!login.totpEnabledAt } : null,
+      consent: { consentToShareAt: worker.consentToShareAt },
+      documents: db.select().from(workerDocuments).where(eq(workerDocuments.workerId, worker.id)).orderBy(workerDocuments.createdAt).all().map(publicDocument),
+      unavailability: db.select().from(workerUnavailability).where(eq(workerUnavailability.workerId, worker.id)).all(),
+      weekHours: db.select().from(workerWeekHours).where(eq(workerWeekHours.workerId, worker.id)).orderBy(workerWeekHours.weekStart).all(),
+      assignments: assignments.map((a) => ({ id: a.id, status: a.status, requestedAt: a.requestedAt, shift: { id: a.shiftId, title: a.title, hostOrgName: a.hostOrgName, siteName: a.siteName, startsAt: a.startsAt, endsAt: a.endsAt } })),
+      timesheets: db.select().from(timesheets).where(eq(timesheets.workerId, worker.id)).orderBy(timesheets.createdAt).all(),
+      ratings: db.select({ score: ratings.score, comment: ratings.comment, createdAt: ratings.createdAt }).from(ratings).where(eq(ratings.workerId, worker.id)).all(),
+      // Decision 14: the bar's reason is between the host and the employer unless they share it.
+      bars,
+      reports: db
+        .select({ id: workerReports.id, category: workerReports.category, status: workerReports.status, createdAt: workerReports.createdAt, acknowledgedAt: workerReports.acknowledgedAt, closedAt: workerReports.closedAt })
+        .from(workerReports)
+        .where(eq(workerReports.workerId, worker.id))
+        .all(),
+    };
+    if (q.download) res.setHeader('Content-Disposition', `attachment; filename="worker-${worker.id}.json"`);
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.json(bundle);
+  }),
+);
+
+/** A worker asks for their data to go. The employer's admins decide when, because the booking and pay records must settle first. */
+workersRouter.post(
+  '/:id/erasure-request',
+  h((req, res) => {
+    const { db, now, notifier } = deps(req);
+    const { worker, self } = loadWorker(req, req.params.id!);
+    if (!self) throw forbidden('Only the worker can ask for their own data to be erased');
+    const at = now();
+    const admins = db.select({ id: users.id }).from(users).where(and(eq(users.orgId, worker.orgId), eq(users.role, UserRole.ORG_ADMIN), eq(users.status, 'ACTIVE'))).all();
+    for (const admin of admins) {
+      notifier.send({
+        orgId: worker.orgId,
+        userId: admin.id,
+        type: 'SYSTEM',
+        title: `${worker.firstName} ${worker.lastName} asked for their personal data to be erased (GDPR)`,
+        body: 'Deactivate them when they have left, then use Erase personal data on their record.',
+        data: { kind: 'erasure-request', workerId: worker.id },
+      });
+    }
+    auditFromReq(req, db, { action: 'REQUEST', entityType: 'worker', entityId: worker.id, data: { erasure: true } }, at);
+    res.status(202).json({ requestedAt: at });
+  }),
+);
+
+const ERASURE_KEEPS = ['timesheets', 'invoices', 'ratings', 'audit'] as const;
+
+/**
+ * Erase a leaver's personal data. The worker row stays as "Former Worker" so timesheets, invoices,
+ * ratings and the audit trail (financial and safety records, decision 18) keep their links.
+ */
+workersRouter.post(
+  '/:id/erase',
+  requireRole(...ADMINS),
+  h(async (req, res) => {
+    const { db, now } = deps(req);
+    const { worker } = loadWorker(req, req.params.id!);
+    const body = parseBody(req, z.object({ reason: z.string().trim().min(1).max(500) }));
+    if (worker.erasedAt) throw conflict('Personal data has already been erased');
+    if (worker.status === 'ACTIVE') throw conflict('Deactivate the worker first; an active worker cannot be erased');
+    const at = now();
+    const future = db
+      .select({ id: shiftAssignments.id })
+      .from(shiftAssignments)
+      .innerJoin(shifts, eq(shifts.id, shiftAssignments.shiftId))
+      .where(and(eq(shiftAssignments.workerId, worker.id), inArray(shiftAssignments.status, ['REQUESTED', 'OFFERED', 'CONFIRMED']), gt(shifts.startsAt, at)))
+      .all();
+    if (future.length) throw conflict('The worker still has bookings or requests for shifts that have not started', { assignments: future.map((a) => a.id) });
+
+    const docs = db.select({ id: workerDocuments.id, fileKey: workerDocuments.fileKey }).from(workerDocuments).where(eq(workerDocuments.workerId, worker.id)).all();
+    db.delete(workerDocuments).where(eq(workerDocuments.workerId, worker.id)).run();
+    db.delete(workerUnavailability).where(eq(workerUnavailability.workerId, worker.id)).run();
+    db.delete(workerWeekHours).where(eq(workerWeekHours.workerId, worker.id)).run();
+    db.update(ratings).set({ comment: null }).where(eq(ratings.workerId, worker.id)).run();
+    if (worker.userId) {
+      db.delete(notificationPreferences).where(eq(notificationPreferences.userId, worker.userId)).run();
+      db.delete(authTokens).where(eq(authTokens.userId, worker.userId)).run();
+      db.update(users)
+        .set({ status: 'DISABLED', email: `erased-${worker.userId}@erased.invalid`, passwordHash: await hashPassword(randomBytes(32).toString('hex')), firstName: 'Former', lastName: 'Worker', phone: null, totpSecret: null, totpEnabledAt: null, siteIds: null })
+        .where(eq(users.id, worker.userId))
+        .run();
+    }
+    db.update(workers)
+      .set({ firstName: 'Former', lastName: 'Worker', email: null, phone: null, postcode: null, lat: null, lng: null, notes: null, skills: [], shareable: false, erasedAt: at, updatedAt: at })
+      .where(eq(workers.id, worker.id))
+      .run();
+    auditFromReq(req, db, { action: 'DELETE', entityType: 'worker', entityId: worker.id, data: { reason: body.reason, documents: docs.length } }, at);
+    // Files go last: the record is already gone, so a storage hiccup must not leave the request half-done.
+    for (const d of docs) if (d.fileKey) await getStorage().delete(d.fileKey).catch(() => undefined);
+    res.json({ erasedAt: at, kept: ERASURE_KEEPS });
   }),
 );

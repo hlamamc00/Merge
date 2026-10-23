@@ -1,15 +1,17 @@
 import { useQuery } from '@tanstack/react-query';
+import { useState } from 'react';
 import { Link } from 'react-router-dom';
 import { JOB_ROLE_LABELS } from '@merge/shared';
 import { api } from '../api/client';
-import { useAssignments, useAvailableShifts, useFlags, useNetworkCapacity, useOrgStats, useTimesheets } from '../api/hooks';
+import { useAction, useAssignments, useAvailableShifts, useFlags, useNetworkCapacity, useOrgStats, useTimesheets } from '../api/hooks';
 import type { AdminOverview, SuppliedShift } from '../api/types';
 import type { ComplianceOverview } from '../api/types.compliance';
 import { useAuth } from '../auth/AuthContext';
 import { ShiftCard } from '../components/ShiftCard';
 import { StatusBadge } from '../components/badges';
-import { Card, EmptyState, LinkButton, Loading, PageHeader, Progress, StatCard } from '../components/ui';
+import { Button, Card, EmptyState, ErrorBanner, LinkButton, Loading, PageHeader, Progress, StatCard } from '../components/ui';
 import { fmtDate, fmtHours, fmtMoney, fmtShiftWindow, humanise } from '../lib/format';
+import { downloadCsv } from './FinancePage';
 
 export function DashboardPage() {
   const { isPlatformAdmin, isWorker } = useAuth();
@@ -297,7 +299,25 @@ function WorkerDashboard() {
           </ul>
         )}
       </Card>
+      {me?.user.workerId && <MyDataCard workerId={me.user.workerId} />}
     </div>
+  );
+}
+
+/** Decision 18: a worker can take their data with them, or ask their employer to erase it once they have left. */
+function MyDataCard({ workerId }: { workerId: string }) {
+  const [dlError, setDlError] = useState<unknown>(null);
+  const [requestedAt, setRequestedAt] = useState<string | null>(null);
+  const ask = useAction(() => api.post<{ requestedAt: string }>(`/workers/${workerId}/erasure-request`), (r) => setRequestedAt(r.requestedAt));
+  return (
+    <Card title="My data" description="Everything Merge holds about you: profile, documents, bookings and timesheets.">
+      <ErrorBanner error={dlError ?? ask.error} className="mb-3" />
+      <div className="flex flex-wrap gap-2">
+        <Button variant="secondary" size="sm" onClick={() => downloadCsv(`/workers/${workerId}/export?download=1`, 'my-data.json').catch(setDlError)}>Download my data</Button>
+        {!requestedAt && <Button variant="ghost" size="sm" loading={ask.isPending} onClick={() => { if (window.confirm('Ask your employer to erase your personal data once you have left? Pay and shift records are kept as the law requires.')) ask.mutate(); }}>Ask for my data to be erased</Button>}
+      </div>
+      {requestedAt && <p className="mt-3 text-sm text-slate-600">Request sent to your employer on {fmtDate(requestedAt)}. They erase your personal data once you have left and your last shifts are settled.</p>}
+    </Card>
   );
 }
 

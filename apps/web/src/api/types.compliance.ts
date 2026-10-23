@@ -171,3 +171,33 @@ export interface MyDocuments {
 }
 
 export type { DocumentType };
+
+/** One booked worker on one shift, with each mandatory check as it stood on the day (REP-01, decision 13: status only). */
+export interface WorkforceRow {
+  shiftId: string;
+  siteId: string;
+  siteName: string;
+  shiftDate: string;
+  startsAt: string;
+  endsAt: string;
+  jobRole: JobRole;
+  shiftTitle: string;
+  workerId: string;
+  workerName: string;
+  employerOrgId: string;
+  employerName: string;
+  attendance: 'COMPLETED' | 'NO_SHOW' | 'CONFIRMED' | 'CANCELLED';
+  paidHours: number;
+  timesheetStatus: string | null;
+  documents: Partial<Record<DocumentType, 'VALID' | 'EXPIRED' | 'UNVERIFIED' | 'MISSING'>>;
+  compliantOnDay: boolean;
+}
+
+export interface WorkforceReport {
+  orgId: string;
+  siteId: string | null;
+  from: string;
+  to: string;
+  rows: WorkforceRow[];
+  summary: { shifts: number; workers: number; employers: number; nonCompliantOnDay: number };
+}

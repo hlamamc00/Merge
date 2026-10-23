@@ -105,6 +105,8 @@ export interface Worker {
   travelRadiusKm: number | null;
   hourlyPayRate?: number | null;
   notes?: string | null;
+  /** Decision 18: set once the personal data has been erased (the row stays as "Former Worker"). */
+  erasedAt?: string | null;
   createdAt: string;
 }
 

@@ -1,15 +1,16 @@
-import { useQuery } from '@tanstack/react-query';
+import { useMutation, useQuery } from '@tanstack/react-query';
 import { useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { DOCUMENT_LABELS, DocumentType, JOB_ROLE_LABELS } from '@merge/shared';
 import { api } from '../api/client';
 import { useAction, useSites } from '../api/hooks';
-import type { ComplianceOverview, ExpiringDocument, HostRequirement, MyDocuments, QueuedDocument, RequirementHolder } from '../api/types.compliance';
+import type { ComplianceOverview, ExpiringDocument, HostRequirement, MyDocuments, QueuedDocument, RequirementHolder, WorkforceReport } from '../api/types.compliance';
 import { useAuth } from '../auth/AuthContext';
 import { StatusBadge } from '../components/badges';
 import { Badge, Button, Card, Checkbox, EmptyState, ErrorBanner, Field, InfoBanner, Input, Loading, Modal, PageHeader, Select, StatCard, Table, Tabs, Textarea } from '../components/ui';
 import { fmtBytes, openProtectedFile, uploadFile } from '../lib/files';
-import { fmtDate, fmtDateTime } from '../lib/format';
+import { fmtDate, fmtDateTime, toDateInput } from '../lib/format';
+import { downloadCsv } from './FinancePage';
 
 type Tab = 'expiring' | 'queue' | 'requirements';
 
@@ -40,7 +41,71 @@ function ManagerCompliancePage() {
       {tab === 'expiring' && <ExpiringReport />}
       {tab === 'queue' && <VerificationQueue />}
       {tab === 'requirements' && <RequirementsPanel />}
+      <WorkforceReportCard />
     </div>
+  );
+}
+
+const DOC_TONES = { VALID: 'green', UNVERIFIED: 'amber', EXPIRED: 'red', MISSING: 'red' } as const;
+
+/** Regulator-ready record of who worked at our sites, for whom, with which checks in place on the day (REP-01). */
+function WorkforceReportCard() {
+  const { organisation } = useAuth();
+  const sites = useSites(organisation?.id);
+  const [siteId, setSiteId] = useState('');
+  const [range, setRange] = useState(() => {
+    const to = new Date();
+    const from = new Date(to);
+    from.setDate(from.getDate() - 90);
+    return { from: toDateInput(from), to: toDateInput(to) };
+  });
+  const [dlError, setDlError] = useState<unknown>(null);
+  // Date-only inputs become an inclusive range of whole local days.
+  const params = () => ({ siteId: siteId || undefined, from: new Date(`${range.from}T00:00:00`).toISOString(), to: new Date(`${range.to}T23:59:59.999`).toISOString() });
+  const preview = useMutation({ mutationFn: () => api.get<WorkforceReport>('/reports/workforce', params()) });
+  const download = () => {
+    const p = params();
+    const site = (sites.data ?? []).find((s) => s.id === siteId);
+    const slug = site ? site.name.toLowerCase().replace(/[^a-z0-9]+/g, '-') : 'all-sites';
+    downloadCsv(`/reports/workforce?format=csv&from=${encodeURIComponent(p.from)}&to=${encodeURIComponent(p.to)}${siteId ? `&siteId=${encodeURIComponent(siteId)}` : ''}`, `workforce-${slug}-${range.from}-${range.to}.csv`).catch(setDlError);
+  };
+  const r = preview.data;
+  return (
+    <Card
+      title="Workforce report (for inspections)"
+      description="Who worked at your sites, which organisation employs them, and whether every mandatory check was valid on the day of the shift. Status only: the documents and references stay with the employer."
+      actions={<Button size="sm" variant="secondary" onClick={download}>⇩ Download CSV</Button>}
+    >
+      <div className="grid gap-3 sm:grid-cols-4">
+        <Field label="Site"><Select value={siteId} onChange={(e) => setSiteId(e.target.value)}><option value="">All sites</option>{(sites.data ?? []).map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}</Select></Field>
+        <Field label="From"><Input type="date" value={range.from} onChange={(e) => setRange({ ...range, from: e.target.value })} /></Field>
+        <Field label="To"><Input type="date" value={range.to} onChange={(e) => setRange({ ...range, to: e.target.value })} /></Field>
+        <div className="flex items-end"><Button onClick={() => preview.mutate()} loading={preview.isPending}>Preview</Button></div>
+      </div>
+      <ErrorBanner error={preview.error ?? dlError} className="mt-3" />
+      {r && (
+        <div className="mt-3">
+          <p className="mb-2 text-xs text-slate-500">
+            {r.summary.shifts} shift(s) · {r.summary.workers} worker(s) · {r.summary.employers} employer(s) · {r.summary.nonCompliantOnDay} not compliant on the day
+            {r.rows.length > 25 && ` · showing the first 25 of ${r.rows.length} rows; the CSV has them all`}
+          </p>
+          <Table
+            rows={r.rows.slice(0, 25)}
+            rowKey={(row) => `${row.shiftId}-${row.workerId}`}
+            empty={<EmptyState title="No bookings in this period" description="Confirmed, completed and no-show bookings on your shifts appear here." />}
+            columns={[
+              { key: 'date', header: 'Date', render: (row) => <>{fmtDate(row.startsAt)}<div className="text-xs text-slate-500">{row.siteName}</div></> },
+              { key: 'worker', header: 'Worker', render: (row) => <span className="font-medium text-slate-900">{row.workerName}</span> },
+              { key: 'employer', header: 'Employer', render: (row) => row.employerName },
+              { key: 'role', header: 'Role', render: (row) => JOB_ROLE_LABELS[row.jobRole] },
+              { key: 'attendance', header: 'Attendance', render: (row) => <StatusBadge status={row.attendance} /> },
+              { key: 'ok', header: 'Compliant on day', render: (row) => row.compliantOnDay ? <Badge tone="green">Yes</Badge> : <Badge tone="red">No</Badge> },
+              { key: 'docs', header: 'Checks', render: (row) => <span className="flex flex-wrap gap-1">{(Object.entries(row.documents) as Array<[DocumentType, keyof typeof DOC_TONES]>).map(([type, status]) => <Badge key={type} tone={DOC_TONES[status]}>{DOCUMENT_LABELS[type]}: {status.toLowerCase()}</Badge>)}</span> },
+            ]}
+          />
+        </div>
+      )}
+    </Card>
   );
 }
 

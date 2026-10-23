@@ -31,6 +31,7 @@ export const DEFAULT_IMMEDIATE: NT[] = [
   NotificationType.TIMESHEET_DISPUTED,
   NotificationType.SYSTEM,
   NotificationType.FLAG_FULFILLED,
+  NotificationType.FLAG_EXPIRED,
 ];
 
 /** Collected into one daily email. */

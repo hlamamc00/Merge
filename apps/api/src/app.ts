@@ -16,6 +16,7 @@ import { capacityRouter } from './routes/capacity.js';
 import { invoicesRouter } from './routes/invoices.js';
 import { notificationsRouter } from './routes/notifications.js';
 import { organisationsRouter } from './routes/organisations.js';
+import { reportsRouter } from './routes/reports.js';
 import { shiftsRouter } from './routes/shifts.js';
 import { timesheetsRouter } from './routes/timesheets.js';
 import { workersRouter } from './routes/workers.js';
@@ -53,6 +54,7 @@ export function createApp(opts: CreateAppOptions) {
   app.use('/api/v1/trust', trustRouter);
   app.use('/api/v1/finance', financeRouter);
   app.use('/api/v1/compliance', complianceRouter);
+  app.use('/api/v1/reports', reportsRouter);
   app.use('/api', (_req, res) => res.status(404).json({ error: 'Not found' }));
   app.use(errorMiddleware);
   return { app, deps };

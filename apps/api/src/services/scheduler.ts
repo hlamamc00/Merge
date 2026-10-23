@@ -52,7 +52,7 @@ const lastDailyRun = new WeakMap<Db, string>();
 export function tick(db: Db, notifier: Notifier, now: Date): TickResult {
   const shiftsResult = progressShifts(db, notifier, now);
   const stagesOpened = notifyDueAccess(db, notifier, now);
-  const flagsExpired = expireFlags(db, now);
+  const flagsExpired = expireFlags(db, notifier, now);
   const settings = getSettings(db);
   const escalations = runEscalations(db, notifier, settings, now);
   const unfilledWarnings = warnUnfilledSoon(db, notifier, now);
@@ -90,7 +90,10 @@ export function purgeSupersededDocuments(db: Db, retentionYears: number, now: Da
   return stale.length;
 }
 
-/** Tell employers about documents expiring in the next 30 days (at most one alert per document per week). */
+/**
+ * Tell employers about documents expiring in the next 30 days (at most one alert per document per week).
+ * CMP-02: a worker with a login is told too, in their own words, so they can renew without waiting for the office.
+ */
 export function alertExpiringDocuments(db: Db, notifier: Notifier, now: Date, horizonDays = 30): number {
   const horizon = addDays(now, horizonDays);
   const expiring = db
@@ -116,13 +119,25 @@ export function alertExpiringDocuments(db: Db, notifier: Notifier, now: Date, ho
       .some((n) => (n.data as { documentId?: string } | null)?.documentId === doc.id);
     if (recent) continue;
     const days = Math.ceil((doc.expiresAt!.getTime() - now.getTime()) / 86_400_000);
+    const label = DOCUMENT_LABELS[doc.type];
     notifier.send({
       orgId: worker.orgId,
       type: NotificationType.DOCUMENT_EXPIRING,
-      title: `${DOCUMENT_LABELS[doc.type]} expiring for ${worker.firstName} ${worker.lastName}`,
+      title: `${label} expiring for ${worker.firstName} ${worker.lastName}`,
       body: days <= 0 ? 'Expires today. The worker cannot be sent on shifts after this date until renewed.' : `Expires in ${days} day(s). Shifts after that date will be blocked until the document is renewed and verified.`,
       data: { documentId: doc.id, workerId: worker.id },
     });
+    // The weekly rule above covers this copy too: both are sent together and share the documentId.
+    if (worker.userId) {
+      notifier.send({
+        orgId: worker.orgId,
+        userId: worker.userId,
+        type: NotificationType.DOCUMENT_EXPIRING,
+        title: `Your ${label} ${days <= 0 ? 'expires today' : `expires in ${days} day(s)`}`,
+        body: `Your ${label} ${days <= 0 ? 'expires today' : `expires in ${days} days`}. Upload the renewed certificate from My documents so you can keep taking shifts.`,
+        data: { documentId: doc.id, workerId: worker.id },
+      });
+    }
     sent++;
   }
   return sent;

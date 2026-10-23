@@ -116,3 +116,44 @@ Scopes: `posted` = my organisation hosts (managers); `available` = released or s
 | POST | `/admin/scheduler/tick` |
 
 `GET /api/health` is unauthenticated.
+
+## Changes: platform fixes after the simulation
+
+### Confirmation re-checks eligibility
+Requests and offers are soft holds (decision 7), so a worker's position can change before the host answers. `POST /assignments/:id/confirm`, `POST /assignments/:id/accept` and `POST /assignments/bulk { action: confirm }` now re-run the eligibility rules against the shift at confirmation time, with the same `allowHoursOverride` the request carried. Access-window codes (`ACCESS_NOT_OPEN`, `NO_ACCESS`) are ignored, since the pending row already had access; every other blocker counts (`WEEKLY_HOURS_EXCEEDED`, `INSUFFICIENT_REST`, `OVERLAPPING_SHIFT`, `NON_COMPLIANT`, `BARRED_BY_HOST`, `WORKER_NOT_SHAREABLE`, `MISSING_SKILLS`, …).
+
+When a blocker is found the assignment is set to `DECLINED` with note `No longer eligible at confirmation: <first blocker>`, the supplier gets a `SHIFT_DECLINED` notification (`data.kind = 'no-longer-eligible'`, `data.blockers[]`), a `DECLINE` audit entry records the blockers, and the call fails:
+
+```
+409 { error: "<worker> is no longer eligible: <messages>", details: { code: "NO_LONGER_ELIGIBLE", blockers: [{ code, message }] } }
+```
+
+The bulk endpoint reports it per row: `{ id, ok: false, error, details: { code: "NO_LONGER_ELIGIBLE", blockers } }` (rows now carry `details` whenever the failure has structured details). The worker's other pending requests are not touched; the shift stays open.
+
+### Document expiry alerts reach the worker
+The scheduler's `DOCUMENT_EXPIRING` alert (documents expiring within 30 days, at most once a week per document) is also sent to the worker when they have a login: a second notification with `userId` set, worded for them ("Your <document> expires in N days. Upload the renewed certificate from My documents so you can keep taking shifts."). Managers keep seeing only the organisation-wide copy; the worker sees only theirs.
+
+### `FLAG_EXPIRED` notification
+New `NotificationType.FLAG_EXPIRED`, emailed immediately by default. When the scheduler expires a `SURPLUS` flag whose period has passed, the organisation gets one notice: title `Your surplus flag has expired`, body `Your <role or 'any role'> surplus flag ran out on <date>. Raise it again from Capacity flags if you still have spare staff; without an active flag you no longer get first access.`, `data: { flagId, kind, jobRole }`. Shortage flags expire silently.
+
+### Suspension side effects (`PATCH /organisations/:id { status: SUSPENDED }`)
+Platform admin only. When the organisation was not already suspended:
+
+1. Every `DRAFT`, `OPEN` or `FILLED` shift it hosts that has not started is cancelled (`cancellationReason` starts `Organisation suspended`). Live requests, offers and confirmed bookings on those shifts are cancelled too, without a late-cancellation mark, and each supplier gets `SHIFT_CANCELLED`; a suspended host cannot receive staff. Cancelled shifts drop off every organisation's available board.
+2. Confirmed bookings of the organisation's own workers at other hosts that have not started are left in place. Each such host gets one `SYSTEM` notification (`data.kind = 'supplier-suspended'`, `data.assignmentIds[]`): "<org> has been suspended from the network; your confirmed booking(s) with its staff on <dates> stand. Contact the platform if you want them re-covered."
+3. The `UPDATE` audit entry carries `{ shiftsCancelled, bookingsHonoured }`.
+4. The response is the organisation row plus `effects: { shiftsCancelled, bookingsHonoured }`.
+
+Suspending an already-suspended organisation, or reinstating it (`status: ACTIVE`), returns the row without `effects` and changes nothing else. An unknown organisation is `404`.
+
+## Reports
+| Method | Path | Who |
+| --- | --- | --- |
+| GET | `/reports/workforce?orgId&siteId&from&to&format=json|csv` | host OA/OM (a site-limited manager: their sites only) / PA for any `orgId`. Defaults: the caller's organisation, the last 90 days. Every CONFIRMED, COMPLETED or NO_SHOW booking on the host's shifts starting in `[from, to]` → `{ orgId, siteId, from, to, rows[], summary: { shifts, workers, employers, nonCompliantOnDay } }`; each row `{ shiftId, siteId, siteName, shiftDate (Europe/London), startsAt, endsAt, jobRole, shiftTitle, workerId, workerName, employerOrgId, employerName, attendance, paidHours, timesheetStatus, documents: { [type]: VALID|EXPIRED|UNVERIFIED|MISSING }, compliantOnDay }`, judged as of the shift date from the full document history (decision 13: status only, never references or pay). `format=csv` returns `text/csv` as `workforce-<site>-<from>-<to>.csv` with one column per document type. |
+
+## Worker data (decision 18)
+| Method | Path | Who |
+| --- | --- | --- |
+| GET | `/workers/:id/export?download=1` | the worker's own login, employer OA or unrestricted OM, PA → `{ exportedAt, worker, login, consent, documents (incl. superseded history, never file keys), unavailability, weekHours, assignments, timesheets, ratings, bars, reports }`; `download=1` adds `Content-Disposition: attachment; filename="worker-<id>.json"`. |
+| POST | `/workers/:id/erasure-request` | the worker's own login → 202 `{ requestedAt }`; every ORG_ADMIN of the employer is notified (SYSTEM) and the request is audited. |
+| POST | `/workers/:id/erase` | employer OA / PA – `{ reason }` → `{ erasedAt, kept: ['timesheets', 'invoices', 'ratings', 'audit'] }`. 409 while the worker is ACTIVE, still has a REQUESTED/OFFERED/CONFIRMED assignment on a shift that has not started, or is already erased. Replaces the name with "Former Worker"; clears contact details, location, notes, skills and sharing; deletes documents (and their files), unavailability, week hours and the login's notification preferences; disables the login with a scrambled email and password and no authenticator. Timesheets, invoices, rating scores and the audit trail are kept. |

@@ -1,16 +1,18 @@
 import { Router } from 'express';
-import { and, desc, eq, gte, inArray, lte, sql } from 'drizzle-orm';
+import { and, desc, eq, gt, gte, inArray, lte, sql } from 'drizzle-orm';
 import { z } from 'zod';
-import { RelationshipKind, ServiceType, UserRole, addDays } from '@merge/shared';
+import { NotificationType, RelationshipKind, ServiceType, UserRole, addDays } from '@merge/shared';
 import { auditLog, orgRelationships, organisations, shiftAssignments, shifts, sites, timesheets, users, workers } from '../db/schema.js';
 import { auditFromReq } from '../lib/audit.js';
 import { ADMINS, MANAGERS, allowedSiteIds, assertOrgAccess, assertSiteAccess, hashPassword, isPlatformAdmin, isSiteScoped, requireAuth, requireRole } from '../lib/auth.js';
 import { auth, deps } from '../lib/context.js';
 import { conflict, forbidden, h, notFound } from '../lib/errors.js';
 import { newId } from '../lib/ids.js';
+import type { Notifier } from '../lib/notify.js';
 import { assertChanges, parseBody, parseQuery, zOptionalDate, zPostcode } from '../lib/validate.js';
 import { approvalBlockers, mouDocument } from '../services/compliance.js';
 import { getSettings } from '../services/settings.js';
+import { cancelShift } from '../services/shifts.js';
 import { publicUser, zOrganisation } from './auth.js';
 
 export const organisationsRouter = Router();
@@ -51,8 +53,10 @@ organisationsRouter.patch(
   '/:id',
   requireRole(...ADMINS),
   h((req, res) => {
-    const { db, now } = deps(req);
+    const { db, now, notifier } = deps(req);
     assertOrgAccess(req, req.params.id!);
+    const before = db.select().from(organisations).where(eq(organisations.id, req.params.id!)).get();
+    if (!before) throw notFound('Organisation');
     const body = parseBody(
       req,
       zOrganisation.partial().extend({
@@ -68,10 +72,48 @@ organisationsRouter.patch(
     const at = now();
     const statusExtras = body.status === 'ACTIVE' ? { suspendedReason: null, priorityPenaltyUntil: null } : {};
     db.update(organisations).set({ ...body, ...statusExtras, updatedAt: at }).where(eq(organisations.id, req.params.id!)).run();
-    auditFromReq(req, db, { action: 'UPDATE', entityType: 'organisation', entityId: req.params.id!, data: body }, at);
-    res.json(db.select().from(organisations).where(eq(organisations.id, req.params.id!)).get());
+    const effects = body.status === 'SUSPENDED' && before.status !== 'SUSPENDED' ? applySuspension(db, notifier, before, at) : undefined;
+    auditFromReq(req, db, { action: 'UPDATE', entityType: 'organisation', entityId: req.params.id!, data: { ...body, ...effects } }, at);
+    const row = db.select().from(organisations).where(eq(organisations.id, req.params.id!)).get();
+    res.json(effects ? { ...row, effects } : row);
   }),
 );
+
+const shiftDateFmt = new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/London', weekday: 'short', day: 'numeric', month: 'short' });
+
+/**
+ * PLT-01: a suspended organisation cannot receive staff, so its unstarted shifts are cancelled (bookings on
+ * them included, since its users are locked out). Bookings its own staff hold at other hosts stand until the
+ * owner decides otherwise; those hosts are told so nobody is caught out.
+ */
+function applySuspension(db: ReturnType<typeof deps>['db'], notifier: Notifier, org: typeof organisations.$inferSelect, at: Date): { shiftsCancelled: number; bookingsHonoured: number } {
+  const unstarted = db
+    .select()
+    .from(shifts)
+    .where(and(eq(shifts.hostOrgId, org.id), inArray(shifts.status, ['DRAFT', 'OPEN', 'FILLED']), gt(shifts.startsAt, at)))
+    .all();
+  for (const shift of unstarted) cancelShift(db, notifier, shift, 'Organisation suspended; it can no longer receive staff', at);
+
+  const honoured = db
+    .select({ assignmentId: shiftAssignments.id, hostOrgId: shifts.hostOrgId, startsAt: shifts.startsAt })
+    .from(shiftAssignments)
+    .innerJoin(shifts, eq(shifts.id, shiftAssignments.shiftId))
+    .where(and(eq(shiftAssignments.supplierOrgId, org.id), eq(shiftAssignments.status, 'CONFIRMED'), gt(shifts.startsAt, at)))
+    .orderBy(shifts.startsAt)
+    .all();
+  const byHost = new Map<string, typeof honoured>();
+  for (const row of honoured) byHost.set(row.hostOrgId, [...(byHost.get(row.hostOrgId) ?? []), row]);
+  for (const [hostOrgId, rows] of byHost) {
+    notifier.send({
+      orgId: hostOrgId,
+      type: NotificationType.SYSTEM,
+      title: `${org.name} suspended: your booking(s) with its staff stand`,
+      body: `${org.name} has been suspended from the network; your confirmed booking(s) with its staff on ${rows.map((r) => shiftDateFmt.format(r.startsAt)).join(', ')} stand. Contact the platform if you want them re-covered.`,
+      data: { organisationId: org.id, assignmentIds: rows.map((r) => r.assignmentId), kind: 'supplier-suspended' },
+    });
+  }
+  return { shiftsCancelled: unstarted.length, bookingsHonoured: honoured.length };
+}
 
 /**
  * Decision 12: activate a pending organisation. Refused until the organisation has a regulator
