@@ -67,6 +67,41 @@ assignmentsRouter.get(
   }),
 );
 
+/**
+ * DSP-02: confirm or decline many requests at once. Each id is processed independently; a failure on one
+ * (already answered, not the host's, shift full) is reported in its row and does not stop the others.
+ */
+assignmentsRouter.post(
+  '/bulk',
+  requireRole(...MANAGERS),
+  h((req, res) => {
+    const { db, now, notifier } = deps(req);
+    const { user, org, settings } = auth(req);
+    const body = parseBody(req, z.object({ ids: z.array(z.string()).min(1).max(100), action: z.enum(['confirm', 'decline']), reason: z.string().max(500).nullable().optional() }));
+    const at = now();
+    const results: Array<{ id: string; ok: boolean; status?: string; error?: string }> = [];
+    for (const id of body.ids) {
+      try {
+        const { assignment, shift, isHost } = load(req, id);
+        if (!isHost) throw forbidden('Only the host organisation can answer requests');
+        if (assignment.status !== 'REQUESTED') throw conflict(`Request is ${assignment.status.toLowerCase()}`);
+        if (body.action === 'confirm') {
+          const updated = confirmAssignment(db, notifier, settings, assignment, { userId: user.id, orgId: shift.hostOrgId }, at);
+          auditFromReq(req, db, { action: 'CONFIRM', entityType: 'shift_assignment', entityId: id, data: { bulk: true } }, at);
+          results.push({ id, ok: true, status: updated.status });
+        } else {
+          const updated = declineAssignment(db, notifier, assignment, { userId: user.id, orgId: isPlatformAdmin(req) ? shift.hostOrgId : org.id }, body.reason ?? null, at);
+          auditFromReq(req, db, { action: 'DECLINE', entityType: 'shift_assignment', entityId: id, data: { bulk: true, reason: body.reason } }, at);
+          results.push({ id, ok: true, status: updated.status });
+        }
+      } catch (err) {
+        results.push({ id, ok: false, error: err instanceof Error ? err.message : String(err) });
+      }
+    }
+    res.json({ results });
+  }),
+);
+
 assignmentsRouter.get(
   '/:id',
   h((req, res) => {
@@ -165,7 +200,7 @@ assignmentsRouter.post(
     const { assignment, shift, isHost } = load(req, req.params.id!);
     if (!isHost) throw forbidden('Only the host can record a no-show');
     const at = now();
-    const updated = recordNoShow(db, notifier, assignment, { userId: user.id, orgId: shift.hostOrgId }, at);
+    const updated = recordNoShow(db, notifier, auth(req).settings, assignment, { userId: user.id, orgId: shift.hostOrgId }, at);
     auditFromReq(req, db, { action: 'UPDATE', entityType: 'shift_assignment', entityId: assignment.id, data: { noShow: true } }, at);
     res.json(updated);
   }),

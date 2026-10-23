@@ -6,3 +6,4 @@ export * from './dispatch/engine.js';
 export * from './rules/compliance.js';
 export * from './rules/workingTime.js';
 export * from './rules/eligibility.js';
+export * from './pricing.js';

@@ -1,5 +1,5 @@
-import { and, eq, inArray, isNull, ne } from 'drizzle-orm';
-import { evaluateEligibility, type EligibilityResult } from '@merge/shared';
+import { and, eq, gt, inArray, isNull, lt, ne } from 'drizzle-orm';
+import { evaluateEligibility, type EligibilityIssue, type EligibilityResult } from '@merge/shared';
 import type { Db } from '../db/client.js';
 import {
   hostRequirements,
@@ -20,8 +20,12 @@ import { workingTimeRulesFrom } from './settings.js';
 
 export const LIVE_ASSIGNMENT_STATUSES = ['REQUESTED', 'OFFERED', 'CONFIRMED'] as const;
 
+/** Decision 7: a pending request elsewhere is a soft hold, surfaced as a warning rather than a blocker. */
+export type ShiftWarning = EligibilityIssue | { code: 'PENDING_ELSEWHERE'; message: string };
+export type ShiftEligibilityResult = Omit<EligibilityResult, 'warnings'> & { warnings: ShiftWarning[] };
+
 export interface WorkerShiftEvaluation {
-  result: EligibilityResult;
+  result: ShiftEligibilityResult;
   access: AccessInfo;
 }
 
@@ -36,11 +40,26 @@ export function evaluateWorkerForShift(
   opts: { allowHoursOverride?: boolean } = {},
 ): WorkerShiftEvaluation {
   const documents = db.select().from(workerDocuments).where(eq(workerDocuments.workerId, worker.id)).all();
+  // Decision 7: only firm bookings count as booked time; requests and offers elsewhere are soft holds (warned below).
   const booked = db
     .select({ startsAt: shifts.startsAt, endsAt: shifts.endsAt, breakMinutes: shifts.breakMinutes })
     .from(shiftAssignments)
     .innerJoin(shifts, eq(shifts.id, shiftAssignments.shiftId))
-    .where(and(eq(shiftAssignments.workerId, worker.id), inArray(shiftAssignments.status, [...LIVE_ASSIGNMENT_STATUSES]), ne(shiftAssignments.shiftId, shift.id)))
+    .where(and(eq(shiftAssignments.workerId, worker.id), eq(shiftAssignments.status, 'CONFIRMED'), ne(shiftAssignments.shiftId, shift.id)))
+    .all();
+  const pendingElsewhere = db
+    .select({ status: shiftAssignments.status, title: shifts.title, startsAt: shifts.startsAt })
+    .from(shiftAssignments)
+    .innerJoin(shifts, eq(shifts.id, shiftAssignments.shiftId))
+    .where(
+      and(
+        eq(shiftAssignments.workerId, worker.id),
+        inArray(shiftAssignments.status, ['REQUESTED', 'OFFERED']),
+        ne(shiftAssignments.shiftId, shift.id),
+        lt(shifts.startsAt, shift.endsAt),
+        gt(shifts.endsAt, shift.startsAt),
+      ),
+    )
     .all();
   const unavailable = db
     .select({ startsAt: workerUnavailability.startsAt, endsAt: workerUnavailability.endsAt })
@@ -76,7 +95,7 @@ export function evaluateWorkerForShift(
       .map((r) => r.name);
   }
 
-  const result = evaluateEligibility(
+  const evaluated = evaluateEligibility(
     {
       id: shift.id,
       hostOrgId: shift.hostOrgId,
@@ -116,6 +135,14 @@ export function evaluateWorkerForShift(
       missingHostRequirements,
     },
   );
+  const result: ShiftEligibilityResult = { ...evaluated, warnings: [...evaluated.warnings] };
+  if (pendingElsewhere.length > 0) {
+    const first = pendingElsewhere[0]!;
+    result.warnings.push({
+      code: 'PENDING_ELSEWHERE',
+      message: `${first.status === 'OFFERED' ? 'Offered' : 'Requested'} for an overlapping shift (${first.title}, ${first.startsAt.toISOString()})${pendingElsewhere.length > 1 ? ` and ${pendingElsewhere.length - 1} more` : ''}; whichever is confirmed first wins and the others are withdrawn`,
+    });
+  }
   return { result, access };
 }
 

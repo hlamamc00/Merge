@@ -1,4 +1,4 @@
-import { and, eq, inArray, lte } from 'drizzle-orm';
+import { and, eq, gt, inArray, isNull, lt, lte, ne, or } from 'drizzle-orm';
 import { AssignmentStatus, JOB_ROLE_LABELS, NotificationType, ShiftStatus, hoursBetween, shiftPaidHours } from '@merge/shared';
 import type { Db } from '../db/client.js';
 import { organisations, shiftAccess, shiftAssignments, shifts, workers, type PlatformSettingsRow, type Shift, type ShiftAssignment, type Site, type Worker } from '../db/schema.js';
@@ -7,9 +7,10 @@ import { newId } from '../lib/ids.js';
 import type { Notifier } from '../lib/notify.js';
 import { applyHoursToFlag, releaseHoursFromFlag } from './capacity.js';
 import { evaluateWorkerForShift } from './eligibility.js';
+import { applyNoShowConsequences, platformOwnerOrgId } from './reliability.js';
 import { closeTimesheetForEndedBooking, createDraftTimesheet } from './timesheets.js';
 
-interface Actor {
+export interface Actor {
   userId: string;
   orgId: string;
 }
@@ -145,6 +146,13 @@ export function confirmAssignment(
   assertShiftOpen(shift);
 
   const worker = db.select().from(workers).where(eq(workers.id, assignment.workerId)).get()!;
+  const clash = db
+    .select({ title: shifts.title })
+    .from(shiftAssignments)
+    .innerJoin(shifts, eq(shifts.id, shiftAssignments.shiftId))
+    .where(and(eq(shiftAssignments.workerId, worker.id), eq(shiftAssignments.status, 'CONFIRMED'), ne(shiftAssignments.shiftId, shift.id), lt(shifts.startsAt, shift.endsAt), gt(shifts.endsAt, shift.startsAt)))
+    .get();
+  if (clash) throw conflict(`${workerName(worker)} is already confirmed on an overlapping shift (${clash.title})`);
   const filledCount = shift.filledCount + 1;
   const nowFull = filledCount >= shift.headcount;
 
@@ -161,6 +169,8 @@ export function confirmAssignment(
   createDraftTimesheet(db, settings, shift, getAssignment(db, assignment.id), now);
 
   if (nowFull) declinePendingForShift(db, notifier, shift, 'Shift filled by another worker', now);
+  // Decision 7: the firm booking wins; the worker's soft holds on overlapping shifts are released.
+  withdrawOverlappingPending(db, notifier, worker, shift, now);
 
   const hostName = orgName(db, shift.hostOrgId);
   notifier.send({
@@ -181,6 +191,112 @@ export function confirmAssignment(
     });
   }
   return getAssignment(db, assignment.id);
+}
+
+/** Withdraw a worker's other pending requests/offers that overlap a shift they have just been confirmed on. */
+export function withdrawOverlappingPending(db: Db, notifier: Notifier, worker: Worker, confirmedShift: Shift, now: Date): number {
+  const pending = db
+    .select({ assignment: shiftAssignments, shift: shifts })
+    .from(shiftAssignments)
+    .innerJoin(shifts, eq(shifts.id, shiftAssignments.shiftId))
+    .where(
+      and(
+        eq(shiftAssignments.workerId, worker.id),
+        inArray(shiftAssignments.status, ['REQUESTED', 'OFFERED']),
+        ne(shiftAssignments.shiftId, confirmedShift.id),
+        lt(shifts.startsAt, confirmedShift.endsAt),
+        gt(shifts.endsAt, confirmedShift.startsAt),
+      ),
+    )
+    .all();
+  for (const { assignment, shift } of pending) {
+    db.update(shiftAssignments).set({ status: AssignmentStatus.WITHDRAWN, respondedAt: now, note: 'Worker confirmed elsewhere', updatedAt: now }).where(eq(shiftAssignments.id, assignment.id)).run();
+    notifier.send({
+      orgId: shift.hostOrgId,
+      type: NotificationType.SHIFT_DECLINED,
+      title: `${assignment.status === 'OFFERED' ? 'Offer' : 'Request'} withdrawn: ${workerName(worker)} – ${shift.title}`,
+      body: `Worker confirmed elsewhere for an overlapping shift. ${shift.headcount - shift.filledCount} place(s) still open.`,
+      data: { shiftId: shift.id, assignmentId: assignment.id, kind: 'confirmed-elsewhere' },
+    });
+  }
+  return pending.length;
+}
+
+/**
+ * WF-02 / decision 14: release every future booking of a worker (leaver, or a host bar). Pending requests
+ * and offers are withdrawn; confirmed bookings are cancelled by the actor's organisation. When the actor
+ * is the host (a bar) the cancellation is never a late-cancellation penalty against the supplier.
+ */
+export function cancelFutureBookingsForWorker(
+  db: Db,
+  notifier: Notifier,
+  settings: PlatformSettingsRow,
+  workerId: string,
+  actor: Actor,
+  reason: string,
+  now: Date,
+  opts: { hostOrgId?: string } = {},
+): { withdrawn: string[]; cancelled: string[] } {
+  const rows = db
+    .select({ assignment: shiftAssignments, shift: shifts })
+    .from(shiftAssignments)
+    .innerJoin(shifts, eq(shifts.id, shiftAssignments.shiftId))
+    .where(and(eq(shiftAssignments.workerId, workerId), inArray(shiftAssignments.status, ['REQUESTED', 'OFFERED', 'CONFIRMED']), gt(shifts.startsAt, now), opts.hostOrgId ? eq(shifts.hostOrgId, opts.hostOrgId) : undefined))
+    .all();
+  const withdrawn: string[] = [];
+  const cancelled: string[] = [];
+  for (const { assignment, shift } of rows) {
+    if (assignment.status === 'CONFIRMED') {
+      cancelAssignment(db, notifier, settings, assignment, actor, reason, now);
+      cancelled.push(assignment.id);
+    } else {
+      db.update(shiftAssignments).set({ status: AssignmentStatus.WITHDRAWN, respondedByUserId: actor.userId, respondedAt: now, note: reason, updatedAt: now }).where(eq(shiftAssignments.id, assignment.id)).run();
+      const toOrg = actor.orgId === shift.hostOrgId ? assignment.supplierOrgId : shift.hostOrgId;
+      notifier.send({ orgId: toOrg, type: NotificationType.SHIFT_DECLINED, title: `Withdrawn: ${shift.title}`, body: `${reason}.`, data: { shiftId: shift.id, assignmentId: assignment.id } });
+      withdrawn.push(assignment.id);
+    }
+  }
+  return { withdrawn, cancelled };
+}
+
+/**
+ * Decision 7: requests left unanswered for requestReminderHours, or still pending within
+ * requestReminderBeforeStartHours of the start, prompt the platform owner to chase the host. Once per request.
+ */
+export function remindOperatorOfPendingRequests(db: Db, notifier: Notifier, settings: PlatformSettingsRow, now: Date): number {
+  const owner = platformOwnerOrgId(db, settings);
+  if (!owner) return 0;
+  const staleBefore = new Date(now.getTime() - settings.requestReminderHours * 3_600_000);
+  const startHorizon = new Date(now.getTime() + settings.requestReminderBeforeStartHours * 3_600_000);
+  const due = db
+    .select({ assignment: shiftAssignments, shift: shifts, worker: workers, hostName: organisations.name })
+    .from(shiftAssignments)
+    .innerJoin(shifts, eq(shifts.id, shiftAssignments.shiftId))
+    .innerJoin(workers, eq(workers.id, shiftAssignments.workerId))
+    .innerJoin(organisations, eq(organisations.id, shifts.hostOrgId))
+    .where(
+      and(
+        eq(shiftAssignments.status, 'REQUESTED'),
+        isNull(shiftAssignments.operatorRemindedAt),
+        eq(shifts.status, ShiftStatus.OPEN),
+        gt(shifts.startsAt, now),
+        or(lte(shiftAssignments.requestedAt, staleBefore), lte(shifts.startsAt, startHorizon)),
+      ),
+    )
+    .all();
+  for (const { assignment, shift, worker, hostName } of due) {
+    const waitedH = Math.round(hoursBetween(assignment.requestedAt, now));
+    const toStartH = Math.round(hoursBetween(now, shift.startsAt));
+    notifier.send({
+      orgId: owner,
+      type: NotificationType.SYSTEM,
+      title: `Chase ${hostName}: request for ${shift.title} unanswered`,
+      body: `${orgName(db, assignment.supplierOrgId)} put forward ${workerName(worker)} ${waitedH}h ago; the shift starts in ${toStartH}h. Contact the host to confirm or decline so the worker can be released.`,
+      data: { shiftId: shift.id, assignmentId: assignment.id, hostOrgId: shift.hostOrgId, kind: 'request-reminder' },
+    });
+    db.update(shiftAssignments).set({ operatorRemindedAt: now, updatedAt: now }).where(eq(shiftAssignments.id, assignment.id)).run();
+  }
+  return due.length;
 }
 
 /** Close every REQUESTED/OFFERED row on a shift that can no longer take them, telling each supplier why. */
@@ -245,13 +361,15 @@ export function cancelAssignment(db: Db, notifier: Notifier, settings: PlatformS
   return getAssignment(db, assignment.id);
 }
 
-export function recordNoShow(db: Db, notifier: Notifier, assignment: ShiftAssignment, actor: Actor, now: Date): ShiftAssignment {
+export function recordNoShow(db: Db, notifier: Notifier, settings: PlatformSettingsRow, assignment: ShiftAssignment, actor: Actor, now: Date): ShiftAssignment {
   if (assignment.status !== AssignmentStatus.CONFIRMED) throw conflict('Only confirmed bookings can be marked as no-show');
   const shift = getShift(db, assignment.shiftId);
   if (shift.startsAt.getTime() > now.getTime()) throw conflict('The shift has not started yet');
   db.update(shiftAssignments).set({ status: AssignmentStatus.NO_SHOW, respondedByUserId: actor.userId, updatedAt: now }).where(eq(shiftAssignments.id, assignment.id)).run();
   closeTimesheetForEndedBooking(db, assignment.id, 'No-show recorded by the host', now);
   const worker = db.select().from(workers).where(eq(workers.id, assignment.workerId)).get()!;
-  notifier.send({ orgId: assignment.supplierOrgId, type: NotificationType.SHIFT_CANCELLED, title: `No-show recorded: ${workerName(worker)}`, body: `${orgName(db, shift.hostOrgId)} reported that the worker did not attend ${shift.title} on ${shift.startsAt.toISOString()}.`, data: { shiftId: shift.id, assignmentId: assignment.id } });
+  notifier.send({ orgId: assignment.supplierOrgId, type: NotificationType.SHIFT_CANCELLED, title: `No-show recorded: ${workerName(worker)}`, body: `${orgName(db, shift.hostOrgId)} reported that the worker did not attend ${shift.title} on ${shift.startsAt.toISOString()}. This is a disciplinary matter for you as the employer; repeated no-shows affect your priority access on the platform.`, data: { shiftId: shift.id, assignmentId: assignment.id } });
+  // Decision 4: count the employer's no-shows in the window and apply the configured consequence.
+  applyNoShowConsequences(db, notifier, settings, assignment.supplierOrgId, now);
   return getAssignment(db, assignment.id);
 }

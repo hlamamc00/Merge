@@ -1,17 +1,134 @@
-import { and, eq, gt, inArray, lte, ne } from 'drizzle-orm';
-import { JOB_ROLE_LABELS, NotificationType, ShiftStatus, minutesBetween } from '@merge/shared';
+import { and, eq, gt, inArray, isNull, lte, ne } from 'drizzle-orm';
+import { JOB_ROLE_LABELS, NotificationType, ShiftStatus, floorChargeRate, minutesBetween, shiftPaidHours, type DocumentType, type JobRole, type ShiftVisibility, type Skill } from '@merge/shared';
 import type { Db } from '../db/client.js';
-import { notifications, organisations, shiftAccess, shiftAssignments, shifts, sites, type PlatformSettingsRow, type Shift, type Site } from '../db/schema.js';
+import { hostRequirements, notifications, organisations, shiftAccess, shiftAssignments, shifts, sites, type PlatformSettingsRow, type Shift, type Site } from '../db/schema.js';
+import { forbidden, notFound, unprocessable } from '../lib/errors.js';
+import { newId } from '../lib/ids.js';
 import type { Notifier } from '../lib/notify.js';
 import { buildPlan, notifyDueAccess, persistPlan } from './dispatch.js';
 import { releaseHoursFromFlag } from './capacity.js';
-import { shiftPaidHours } from '@merge/shared';
 import { closeTimesheetForEndedBooking } from './timesheets.js';
 import { declinePendingForShift } from './assignments.js';
 
+/** Decision 3: platform-wide floor on the charge rate. */
+export function floorRate(settings: PlatformSettingsRow): number {
+  return floorChargeRate({ minimumWage: settings.nationalMinimumWage, employerOnCostPct: settings.employerOnCostPct, platformFeePct: settings.platformFeePct });
+}
+
+export function floorRateInfo(settings: PlatformSettingsRow) {
+  return {
+    floor: floorRate(settings),
+    basis: {
+      nationalMinimumWage: settings.nationalMinimumWage,
+      employerOnCostPct: settings.employerOnCostPct,
+      platformFeePct: settings.platformFeePct,
+      formula: 'minimum wage × (1 + employer on-costs) ÷ (1 − platform fee), rounded up to 5p',
+    },
+  };
+}
+
+/** Nobody, platform admins included, may post below the floor: the worker's wage and the supplier's on-costs must be covered. */
+export function assertRateAboveFloor(settings: PlatformSettingsRow, chargeRate: number): void {
+  const info = floorRateInfo(settings);
+  if (chargeRate + 1e-9 < info.floor) {
+    throw unprocessable(`Charge rate £${chargeRate.toFixed(2)}/h is below the platform floor of £${info.floor.toFixed(2)}/h`, { floor: info.floor, basis: info.basis });
+  }
+}
+
+/** Decisions 1 and 12: a host must be approved, not suspended and not on credit hold to publish. */
+export function assertHostMayPublish(db: Db, hostOrgId: string, opts: { allowPending?: boolean } = {}): void {
+  const host = db.select({ status: organisations.status, creditHold: organisations.creditHold, suspendedReason: organisations.suspendedReason }).from(organisations).where(eq(organisations.id, hostOrgId)).get();
+  if (!host) throw notFound('Organisation');
+  if (host.creditHold) throw forbidden('Posting is paused while platform invoices are overdue. Drafts are kept; publishing resumes once the account is settled');
+  if (host.status === 'SUSPENDED') throw forbidden(`Your organisation is suspended from the network${host.suspendedReason ? `: ${host.suspendedReason}` : ''}`);
+  if (host.status !== 'ACTIVE' && !opts.allowPending) throw forbidden('Your organisation is awaiting approval by the platform; you can save drafts but not publish');
+}
+
+export interface NewShiftData {
+  siteId: string;
+  jobRole: JobRole;
+  title: string;
+  description?: string | null;
+  startsAt: Date;
+  endsAt: Date;
+  breakMinutes: number;
+  headcount: number;
+  requiredSkills: Skill[];
+  extraRequiredDocuments: DocumentType[];
+  chargeRate: number;
+  visibility: ShiftVisibility;
+  priorityWindowMinutesOverride?: number | null;
+  autoConfirm: boolean;
+  requiredHostRequirementIds?: string[];
+}
+
+/** Decision 11: a shift may only name requirements that belong to the host and are not archived. */
+export function assertHostRequirementIds(db: Db, hostOrgId: string, ids: string[] | undefined): string[] {
+  const wanted = Array.from(new Set(ids ?? []));
+  if (wanted.length === 0) return [];
+  const known = db
+    .select({ id: hostRequirements.id })
+    .from(hostRequirements)
+    .where(and(eq(hostRequirements.hostOrgId, hostOrgId), inArray(hostRequirements.id, wanted), isNull(hostRequirements.archivedAt)))
+    .all()
+    .map((r) => r.id);
+  const unknown = wanted.filter((id) => !known.includes(id));
+  if (unknown.length) throw unprocessable('Unknown host requirement(s) on this shift', { requiredHostRequirementIds: unknown });
+  return wanted;
+}
+
+/** Create a draft (and optionally publish it). Used by the shift route, series posting and copy. */
+export function createShift(
+  db: Db,
+  notifier: Notifier,
+  settings: PlatformSettingsRow,
+  input: { hostOrgId: string; site: Site; data: NewShiftData; publish: boolean; createdByUserId: string | null; seriesId?: string | null; allowPending?: boolean },
+  now: Date,
+): Shift {
+  const { data } = input;
+  if (!(data.endsAt > data.startsAt)) throw unprocessable('endsAt must be after startsAt');
+  if (data.startsAt.getTime() <= now.getTime()) throw unprocessable('Shift must start in the future');
+  assertRateAboveFloor(settings, data.chargeRate);
+  if (input.publish) assertHostMayPublish(db, input.hostOrgId, { allowPending: input.allowPending });
+  const requiredHostRequirementIds = assertHostRequirementIds(db, input.hostOrgId, data.requiredHostRequirementIds);
+  const id = newId('shf');
+  db.insert(shifts)
+    .values({
+      id,
+      hostOrgId: input.hostOrgId,
+      siteId: input.site.id,
+      jobRole: data.jobRole,
+      title: data.title,
+      description: data.description ?? null,
+      startsAt: data.startsAt,
+      endsAt: data.endsAt,
+      breakMinutes: data.breakMinutes,
+      headcount: data.headcount,
+      requiredSkills: data.requiredSkills,
+      extraRequiredDocuments: data.extraRequiredDocuments,
+      chargeRate: data.chargeRate,
+      currency: settings.currency,
+      visibility: data.visibility,
+      priorityWindowMinutesOverride: data.priorityWindowMinutesOverride ?? null,
+      autoConfirm: data.autoConfirm,
+      requiredHostRequirementIds,
+      seriesId: input.seriesId ?? null,
+      status: ShiftStatus.DRAFT,
+      createdByUserId: input.createdByUserId,
+      createdAt: now,
+      updatedAt: now,
+    })
+    .run();
+  const shift = db.select().from(shifts).where(eq(shifts.id, id)).get()!;
+  return input.publish ? publishShift(db, notifier, settings, shift, input.site, now) : shift;
+}
+
 export function publishShift(db: Db, notifier: Notifier, settings: PlatformSettingsRow, shift: Shift, site: Site, now: Date): Shift {
   const plan = buildPlan(db, settings, shift, site, now, now);
-  db.update(shifts).set({ status: ShiftStatus.OPEN, publishedAt: now, urgent: plan.urgent, updatedAt: now }).where(eq(shifts.id, shift.id)).run();
+  db.update(shifts)
+    .set({ status: ShiftStatus.OPEN, publishedAt: now, urgent: plan.urgent, originalChargeRate: shift.originalChargeRate ?? shift.chargeRate, updatedAt: now })
+    .where(eq(shifts.id, shift.id))
+    .run();
   persistPlan(db, plan);
   notifyDueAccess(db, notifier, now);
   return db.select().from(shifts).where(eq(shifts.id, shift.id)).get()!;

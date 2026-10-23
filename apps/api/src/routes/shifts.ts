@@ -1,18 +1,21 @@
 import { Router } from 'express';
 import { and, asc, desc, eq, gt, gte, inArray, lte } from 'drizzle-orm';
 import { z } from 'zod';
-import { DocumentType, JobRole, ShiftStatus, ShiftVisibility, Skill, UserRole, roleCanCover, shiftPaidHours } from '@merge/shared';
-import { capacityFlags, organisations, ratings, shiftAccess, shiftAssignments, shifts, sites, workers, type Shift } from '../db/schema.js';
+import { DocumentType, JobRole, ShiftStatus, ShiftVisibility, Skill, UserRole, complianceSummary, distanceKm, roleCanCover, shiftPaidHours, type ComplianceStatus } from '@merge/shared';
+import type { Db } from '../db/client.js';
+import { capacityFlags, organisations, ratings, shiftAccess, shiftAssignments, shiftSeries, shifts, sites, workerDocuments, workers, type Shift } from '../db/schema.js';
 import { auditFromReq } from '../lib/audit.js';
 import { MANAGERS, assertOrgAccess, isManager, isPlatformAdmin, requireAuth, requireRole } from '../lib/auth.js';
 import { auth, deps } from '../lib/context.js';
 import { conflict, forbidden, h, notFound, unprocessable } from '../lib/errors.js';
-import { newId } from '../lib/ids.js';
 import { parseBody, parseQuery, zDate, zQueryBool } from '../lib/validate.js';
 import { declinePendingForShift, offerShift, requestShift } from '../services/assignments.js';
 import { accessFor, buildPlan, liveAccessReason, notifyDueAccess, planForShift } from '../services/dispatch.js';
 import { evaluateWorkerForShift } from '../services/eligibility.js';
-import { cancelShift, loadSiteForOrg, publishShift } from '../services/shifts.js';
+import { ESCALATION_STEP_PCT, escalateShift, escalationHistory, stepDue } from '../services/escalation.js';
+import { reliabilityFor } from '../services/reliability.js';
+import { MAX_OCCURRENCES, createSeries, expandPattern, seriesShifts } from '../services/series.js';
+import { assertHostMayPublish, assertHostRequirementIds, assertRateAboveFloor, cancelShift, createShift, floorRateInfo, loadSiteForOrg, publishShift } from '../services/shifts.js';
 
 export const shiftsRouter = Router();
 shiftsRouter.use(requireAuth);
@@ -34,9 +37,27 @@ const zShift = z
     visibility: z.nativeEnum(ShiftVisibility).default('NETWORK'),
     priorityWindowMinutesOverride: z.number().int().min(0).max(7 * 24 * 60).nullable().optional(),
     autoConfirm: z.boolean().default(false),
+    /** Decision 11: ids from GET /compliance/requirements that a worker must hold for this shift. */
+    requiredHostRequirementIds: z.array(z.string()).max(20).default([]),
     publish: z.boolean().default(false),
   })
   .refine((b) => b.endsAt > b.startsAt, { message: 'endsAt must be after startsAt' });
+
+/** Decision 11 / board view: a worker's standing against the documents the shift needs, as of the shift date. */
+function complianceStatusFor(db: Db, workerId: string, jobRole: JobRole, shift: Pick<Shift, 'startsAt' | 'extraRequiredDocuments'>): ComplianceStatus {
+  const docs = db.select({ type: workerDocuments.type, expiresAt: workerDocuments.expiresAt, verifiedAt: workerDocuments.verifiedAt }).from(workerDocuments).where(eq(workerDocuments.workerId, workerId)).all();
+  return complianceSummary(docs, jobRole, shift.startsAt, shift.extraRequiredDocuments).status;
+}
+
+const round1 = (n: number) => Math.round(n * 10) / 10;
+
+const SERIES_PATTERN = z.object({
+  startTime: z.string().regex(/^\d{2}:\d{2}$/),
+  durationHours: z.number().positive().max(24),
+  weekdays: z.array(z.number().int().min(0).max(6)).min(1),
+  from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+});
 
 const EDITABLE_WHEN_OPEN = ['title', 'description', 'chargeRate', 'headcount', 'autoConfirm', 'breakMinutes', 'requiredSkills', 'extraRequiredDocuments'] as const;
 
@@ -50,6 +71,79 @@ function guestShift(s: Shift) {
   return rest;
 }
 
+/** Decision 3: the lowest charge rate anyone may post, and how it is worked out. */
+shiftsRouter.get(
+  '/floor-rate',
+  h((req, res) => {
+    res.json(floorRateInfo(auth(req).settings));
+  }),
+);
+
+/** PR-05: post the same shift on many dates. Either an explicit list of occurrences or a weekly pattern. */
+shiftsRouter.post(
+  '/series',
+  requireRole(...MANAGERS),
+  h((req, res) => {
+    const { db, now, notifier } = deps(req);
+    const { user, org, settings } = auth(req);
+    const body = parseBody(
+      req,
+      z
+        .object({
+          template: zShift.innerType().omit({ startsAt: true, endsAt: true, publish: true }),
+          occurrences: z.array(z.object({ startsAt: zDate, endsAt: zDate })).min(1).max(MAX_OCCURRENCES).optional(),
+          pattern: SERIES_PATTERN.optional(),
+          publish: z.boolean().default(false),
+        })
+        .refine((b) => !!b.occurrences || !!b.pattern, { message: 'Provide occurrences or a pattern' }),
+    );
+    const hostOrgId = body.template.hostOrgId ?? org.id;
+    assertOrgAccess(req, hostOrgId);
+    const site = loadSiteForOrg(db, body.template.siteId, hostOrgId);
+    if (!site) throw notFound('Site');
+    const at = now();
+    const occurrences = body.occurrences ?? expandPattern(body.pattern!);
+    const { hostOrgId: _h, ...template } = body.template;
+    const result = createSeries(db, notifier, settings, { orgId: hostOrgId, site, createdByUserId: user.id, allowPending: isPlatformAdmin(req) }, template, occurrences, body.publish, body.pattern ?? { occurrences: occurrences.length }, at);
+    for (const sh of result.shifts) auditFromReq(req, db, { action: 'CREATE', entityType: 'shift', entityId: sh.id, data: { seriesId: result.seriesId } }, at);
+    res.status(201).json({ seriesId: result.seriesId, count: result.shifts.length, shifts: result.shifts.map((sh) => ({ ...publicShift(sh), site })) });
+  }),
+);
+
+shiftsRouter.get(
+  '/series/:id',
+  requireRole(...MANAGERS),
+  h((req, res) => {
+    const { db } = deps(req);
+    const series = db.select().from(shiftSeries).where(eq(shiftSeries.id, req.params.id!)).get();
+    if (!series) throw notFound('Series');
+    assertOrgAccess(req, series.hostOrgId);
+    res.json({ ...series, shifts: seriesShifts(db, series.id).map(publicShift) });
+  }),
+);
+
+/** Cancel every shift in the series that has not started (drafts, open, filled). */
+shiftsRouter.post(
+  '/series/:id/cancel',
+  requireRole(...MANAGERS),
+  h((req, res) => {
+    const { db, now, notifier } = deps(req);
+    const series = db.select().from(shiftSeries).where(eq(shiftSeries.id, req.params.id!)).get();
+    if (!series) throw notFound('Series');
+    assertOrgAccess(req, series.hostOrgId);
+    const body = parseBody(req, z.object({ reason: z.string().max(500).nullable().optional() }));
+    const at = now();
+    const cancelled: string[] = [];
+    for (const sh of seriesShifts(db, series.id)) {
+      if (!['DRAFT', 'OPEN', 'FILLED'].includes(sh.status)) continue;
+      cancelShift(db, notifier, sh, body.reason ?? 'Series cancelled by host', at);
+      auditFromReq(req, db, { action: 'CANCEL', entityType: 'shift', entityId: sh.id, data: { seriesId: series.id, reason: body.reason } }, at);
+      cancelled.push(sh.id);
+    }
+    res.json({ seriesId: series.id, cancelled, shifts: seriesShifts(db, series.id).map(publicShift) });
+  }),
+);
+
 /**
  * scope=posted    shifts my organisation hosts
  * scope=available shifts other organisations have released (or will release) to mine
@@ -60,7 +154,7 @@ shiftsRouter.get(
   '/',
   h((req, res) => {
     const { db, now } = deps(req);
-    const { user, org } = auth(req);
+    const { user, org, settings } = auth(req);
     const q = parseQuery(
       req,
       z.object({
@@ -71,6 +165,10 @@ shiftsRouter.get(
         to: zDate.optional(),
         orgId: z.string().optional(),
         includePast: zQueryBool,
+        /** scope=available only. */
+        sort: z.enum(['opens', 'start', 'rate', 'distance']).default('opens'),
+        nearKm: z.coerce.number().positive().max(500).optional(),
+        seriesId: z.string().optional(),
       }),
     );
     const at = now();
@@ -79,6 +177,7 @@ shiftsRouter.get(
     if (q.jobRole) base.push(eq(shifts.jobRole, q.jobRole));
     if (q.from) base.push(gte(shifts.startsAt, q.from));
     if (q.to) base.push(lte(shifts.startsAt, q.to));
+    if (q.seriesId) base.push(eq(shifts.seriesId, q.seriesId));
 
     if (q.scope === 'all') {
       if (!isPlatformAdmin(req)) throw forbidden();
@@ -114,6 +213,8 @@ shiftsRouter.get(
           site,
           pendingRequests: pending.filter((a) => a.shiftId === shift.id && a.status === 'REQUESTED').length,
           confirmed: pending.filter((a) => a.shiftId === shift.id && a.status === 'CONFIRMED').length,
+          /** Decision 6: an open shift inside the escalation window with places left needs attention. */
+          escalationDue: shift.status === ShiftStatus.OPEN && shift.filledCount < shift.headcount && stepDue(shift.startsAt, at) > 0,
         })),
       );
     }
@@ -166,17 +267,29 @@ shiftsRouter.get(
       : [];
     const flagIds = rows.map((r) => r.access.matchedFlagId).filter((f): f is string => !!f);
     const flagsById = new Map(flagIds.length ? db.select().from(capacityFlags).where(inArray(capacityFlags.id, flagIds)).all().map((f) => [f.id, f]) : []);
-    res.json(
-      rows
-        .filter(({ shift }) => !myWorker || roleCanCover(myWorker.jobRole, shift.jobRole))
-        .map(({ shift, site, hostName, access }) => ({
+    // Distance is measured from the worker's home, or from the organisation's address for a manager.
+    const origin = myWorker?.lat != null && myWorker.lng != null ? { lat: myWorker.lat, lng: myWorker.lng } : org.lat != null && org.lng != null ? { lat: org.lat, lng: org.lng } : null;
+    const out = rows
+      .filter(({ shift }) => !myWorker || roleCanCover(myWorker.jobRole, shift.jobRole))
+      .map(({ shift, site, hostName, access }) => {
+        const distance = origin && site.lat != null && site.lng != null ? round1(distanceKm(origin.lat, origin.lng, site.lat, site.lng)) : null;
+        const evaluation = myWorker ? evaluateWorkerForShift(db, settings, shift, site, myWorker, at) : null;
+        return {
           ...forViewer(guestShift(shift), user.role),
           site: siteForGuest(site),
           hostName,
           access: { tier: access.tier, opensAt: access.opensAt, open: access.opensAt.getTime() <= at.getTime(), reason: liveAccessReason(access.reason, access.matchedFlagId ? flagsById.get(access.matchedFlagId) : null) },
           myAssignments: mine.filter((a) => a.shiftId === shift.id),
-        })),
-    );
+          distanceKm: distance,
+          ...(evaluation ? { eligible: evaluation.result.eligible, blockers: evaluation.result.blockers, warnings: evaluation.result.warnings } : {}),
+        };
+      })
+      .filter((r) => q.nearKm === undefined || (r.distanceKm !== null && r.distanceKm <= q.nearKm));
+    const far = Number.MAX_SAFE_INTEGER;
+    if (q.sort === 'start') out.sort((a, b) => a.startsAt.getTime() - b.startsAt.getTime());
+    else if (q.sort === 'rate') out.sort((a, b) => (b.chargeRate ?? 0) - (a.chargeRate ?? 0) || a.startsAt.getTime() - b.startsAt.getTime());
+    else if (q.sort === 'distance') out.sort((a, b) => (a.distanceKm ?? far) - (b.distanceKm ?? far) || a.startsAt.getTime() - b.startsAt.getTime());
+    res.json(out);
   }),
 );
 
@@ -192,18 +305,11 @@ shiftsRouter.post(
     const site = loadSiteForOrg(db, body.siteId, hostOrgId);
     if (!site) throw notFound('Site');
     const at = now();
-    if (body.startsAt.getTime() <= at.getTime()) throw unprocessable('Shift must start in the future');
-    if (body.publish && org.status !== 'ACTIVE' && !isPlatformAdmin(req)) throw forbidden('Your organisation is awaiting approval by the platform; you can save drafts but not publish');
     const { publish, hostOrgId: _h, ...data } = body;
-    const id = newId('shf');
-    db.insert(shifts).values({ id, hostOrgId, ...data, currency: settings.currency, status: ShiftStatus.DRAFT, createdByUserId: user.id, createdAt: at, updatedAt: at }).run();
-    let shift = db.select().from(shifts).where(eq(shifts.id, id)).get()!;
-    auditFromReq(req, db, { action: 'CREATE', entityType: 'shift', entityId: id }, at);
-    if (publish) {
-      shift = publishShift(db, notifier, settings, shift, site, at);
-      auditFromReq(req, db, { action: 'PUBLISH', entityType: 'shift', entityId: id }, at);
-    }
-    res.status(201).json({ ...publicShift(shift), site, plan: planForShift(db, id) });
+    const shift = createShift(db, notifier, settings, { hostOrgId, site, data, publish, createdByUserId: user.id, allowPending: isPlatformAdmin(req) }, at);
+    auditFromReq(req, db, { action: 'CREATE', entityType: 'shift', entityId: shift.id }, at);
+    if (publish) auditFromReq(req, db, { action: 'PUBLISH', entityType: 'shift', entityId: shift.id }, at);
+    res.status(201).json({ ...publicShift(shift), site, plan: planForShift(db, shift.id) });
   }),
 );
 
@@ -228,7 +334,7 @@ shiftsRouter.get(
   '/:id',
   h((req, res) => {
     const { db, now } = deps(req);
-    const { org, user } = auth(req);
+    const { org, user, settings } = auth(req);
     const { shift, site, hostName } = loadShift(req, req.params.id!);
     const at = now();
     // isHost: the viewer's own organisation posted it. canManage: host or platform admin (oversight of any shift).
@@ -251,7 +357,14 @@ shiftsRouter.get(
       ...assignment,
       supplierName,
       worker: { id: worker.id, firstName: worker.firstName, lastName: worker.lastName, jobRole: worker.jobRole, skills: worker.skills },
+      /** Status only (decision 13): the employer holds the documents. */
+      complianceStatus: complianceStatusFor(db, worker.id, worker.jobRole, shift),
     }));
+    const host = canManage ? db.select({ escalationMode: organisations.escalationMode, escalationCeilingPct: organisations.escalationCeilingPct }).from(organisations).where(eq(organisations.id, shift.hostOrgId)).get() : null;
+    const original = shift.originalChargeRate ?? shift.chargeRate;
+    const myWorker = user.role === UserRole.WORKER && user.workerId ? db.select().from(workers).where(eq(workers.id, user.workerId)).get() : null;
+    const myEvaluation = myWorker && shift.status === ShiftStatus.OPEN ? evaluateWorkerForShift(db, settings, shift, site, myWorker, at).result : null;
+    const origin = myWorker?.lat != null && myWorker.lng != null ? { lat: myWorker.lat, lng: myWorker.lng } : org.lat != null && org.lng != null ? { lat: org.lat, lng: org.lng } : null;
 
     res.json({
       ...(canManage ? publicShift(shift) : forViewer(guestShift(shift), user.role)),
@@ -262,6 +375,22 @@ shiftsRouter.get(
       access: isHost ? null : access,
       plan: canManage ? planForShift(db, shift.id) : undefined,
       assignments,
+      distanceKm: !isHost && origin && site.lat != null && site.lng != null ? round1(distanceKm(origin.lat, origin.lng, site.lat, site.lng)) : null,
+      myEligibility: myEvaluation ? { eligible: myEvaluation.eligible, blockers: myEvaluation.blockers, warnings: myEvaluation.warnings } : undefined,
+      floor: canManage ? floorRateInfo(settings).floor : undefined,
+      escalation: host
+        ? {
+            mode: host.escalationMode,
+            ceilingPct: host.escalationCeilingPct,
+            ceilingRate: Math.round(original * (1 + host.escalationCeilingPct / 100) * 20) / 20,
+            originalChargeRate: original,
+            step: shift.escalationStep,
+            stepDue: shift.status === ShiftStatus.OPEN ? stepDue(shift.startsAt, at) : 0,
+            lastEscalatedAt: shift.lastEscalatedAt,
+            suggestedRaisePct: ESCALATION_STEP_PCT,
+            history: escalationHistory(db, shift.id),
+          }
+        : undefined,
     });
   }),
 );
@@ -278,9 +407,12 @@ shiftsRouter.patch(
     if (shift.status === ShiftStatus.DRAFT) {
       const body = parseBody(req, zShift.innerType().omit({ publish: true, hostOrgId: true }).partial());
       if (body.siteId && !loadSiteForOrg(db, body.siteId, shift.hostOrgId)) throw notFound('Site');
+      if (body.chargeRate !== undefined) assertRateAboveFloor(settings, body.chargeRate);
+      if (body.requiredHostRequirementIds) body.requiredHostRequirementIds = assertHostRequirementIds(db, shift.hostOrgId, body.requiredHostRequirementIds);
       db.update(shifts).set({ ...body, updatedAt: at }).where(eq(shifts.id, shift.id)).run();
     } else if (shift.status === ShiftStatus.OPEN) {
       const body = parseBody(req, zShift.innerType().pick(Object.fromEntries(EDITABLE_WHEN_OPEN.map((k) => [k, true])) as Record<(typeof EDITABLE_WHEN_OPEN)[number], true>).partial());
+      if (body.chargeRate !== undefined) assertRateAboveFloor(settings, body.chargeRate);
       if (body.headcount !== undefined && body.headcount < shift.filledCount) throw conflict(`Headcount cannot be below the ${shift.filledCount} already confirmed`);
       if (body.breakMinutes !== undefined && body.breakMinutes !== shift.breakMinutes && shift.filledCount > 0) {
         throw conflict('The break cannot be changed once workers are confirmed, because their paid hours and flag hours are already committed');
@@ -310,9 +442,10 @@ shiftsRouter.post(
     const { shift, site } = loadShift(req, req.params.id!);
     assertOrgAccess(req, shift.hostOrgId);
     if (shift.status !== ShiftStatus.DRAFT) throw conflict('Only draft shifts can be published');
-    if (auth(req).org.status !== 'ACTIVE' && !isPlatformAdmin(req)) throw forbidden('Your organisation is awaiting approval by the platform; you can save drafts but not publish');
+    assertHostMayPublish(db, shift.hostOrgId, { allowPending: isPlatformAdmin(req) });
     const at = now();
     if (shift.startsAt.getTime() <= at.getTime()) throw unprocessable('Shift must start in the future');
+    assertRateAboveFloor(settings, shift.chargeRate);
     const published = publishShift(db, notifier, settings, shift, site, at);
     auditFromReq(req, db, { action: 'PUBLISH', entityType: 'shift', entityId: shift.id }, at);
     res.json({ ...publicShift(published), site, plan: planForShift(db, shift.id) });
@@ -332,6 +465,71 @@ shiftsRouter.post(
     const cancelled = cancelShift(db, notifier, shift, body.reason ?? null, at);
     auditFromReq(req, db, { action: 'CANCEL', entityType: 'shift', entityId: shift.id, data: { reason: body.reason } }, at);
     res.json(publicShift(cancelled));
+  }),
+);
+
+/** Decision 6: the host escalates by hand at any time: raise the rate and/or open every tier now. */
+shiftsRouter.post(
+  '/:id/escalate',
+  requireRole(...MANAGERS),
+  h((req, res) => {
+    const { db, now, notifier } = deps(req);
+    const { user, settings } = auth(req);
+    const { shift } = loadShift(req, req.params.id!);
+    assertOrgAccess(req, shift.hostOrgId);
+    const body = parseBody(req, z.object({ raiseRatePct: z.number().min(0).max(100).optional(), openToAll: z.boolean().default(true) }));
+    if (shift.status !== ShiftStatus.OPEN) throw conflict(`A ${shift.status.toLowerCase().replace('_', ' ')} shift cannot be escalated`);
+    if (!body.raiseRatePct && !body.openToAll) throw unprocessable('Raise the rate, open to all, or both');
+    const at = now();
+    const r = escalateShift(db, notifier, shift, { mode: 'MANUAL', raiseRatePct: body.raiseRatePct, openToAll: body.openToAll, actor: { userId: user.id, orgId: shift.hostOrgId } }, at);
+    res.json({ ...publicShift(r.shift), previousRate: r.previousRate, newRate: r.newRate, opened: r.opened, step: r.step, floor: floorRateInfo(settings).floor, plan: planForShift(db, shift.id) });
+  }),
+);
+
+/** PR-05: post this shift again on another date (same site, role, rate, requirements). */
+shiftsRouter.post(
+  '/:id/copy',
+  requireRole(...MANAGERS),
+  h((req, res) => {
+    const { db, now, notifier } = deps(req);
+    const { user, settings } = auth(req);
+    const { shift, site } = loadShift(req, req.params.id!);
+    assertOrgAccess(req, shift.hostOrgId);
+    const body = parseBody(req, z.object({ startsAt: zDate, endsAt: zDate, publish: z.boolean().default(false), chargeRate: z.number().positive().max(500).optional() }).refine((b) => b.endsAt > b.startsAt, { message: 'endsAt must be after startsAt' }));
+    const at = now();
+    const copy = createShift(
+      db,
+      notifier,
+      settings,
+      {
+        hostOrgId: shift.hostOrgId,
+        site,
+        publish: body.publish,
+        createdByUserId: user.id,
+        allowPending: isPlatformAdmin(req),
+        data: {
+          siteId: shift.siteId,
+          jobRole: shift.jobRole,
+          title: shift.title,
+          description: shift.description,
+          startsAt: body.startsAt,
+          endsAt: body.endsAt,
+          breakMinutes: shift.breakMinutes,
+          headcount: shift.headcount,
+          requiredSkills: shift.requiredSkills,
+          extraRequiredDocuments: shift.extraRequiredDocuments,
+          chargeRate: body.chargeRate ?? shift.originalChargeRate ?? shift.chargeRate,
+          visibility: shift.visibility,
+          priorityWindowMinutesOverride: shift.priorityWindowMinutesOverride,
+          autoConfirm: shift.autoConfirm,
+          requiredHostRequirementIds: shift.requiredHostRequirementIds,
+        },
+      },
+      at,
+    );
+    auditFromReq(req, db, { action: 'CREATE', entityType: 'shift', entityId: copy.id, data: { copiedFrom: shift.id } }, at);
+    if (body.publish) auditFromReq(req, db, { action: 'PUBLISH', entityType: 'shift', entityId: copy.id }, at);
+    res.status(201).json({ ...publicShift(copy), site, plan: planForShift(db, copy.id) });
   }),
 );
 
@@ -405,6 +603,15 @@ shiftsRouter.get(
     const at = now();
     const openOrgs = db.select({ orgId: shiftAccess.orgId, tier: shiftAccess.tier }).from(shiftAccess).where(and(eq(shiftAccess.shiftId, shift.id), lte(shiftAccess.opensAt, at))).all();
     if (openOrgs.length === 0) return res.json([]);
+    const reliabilityByOrg = new Map<string, ReturnType<typeof reliabilityFor>>();
+    const reliabilityOf = (orgId: string) => {
+      let r = reliabilityByOrg.get(orgId);
+      if (!r) {
+        r = reliabilityFor(db, settings, orgId, at);
+        reliabilityByOrg.set(orgId, r);
+      }
+      return r;
+    };
     const pool = db
       .select({ worker: workers, orgName: organisations.name })
       .from(workers)
@@ -435,6 +642,8 @@ shiftsRouter.get(
         warnings: result.warnings,
         previousShiftsWithYou: myRatings.length,
         yourAverageRating: myRatings.length ? myRatings.reduce((s, r) => s + r.score, 0) / myRatings.length : null,
+        complianceStatus: complianceStatusFor(db, worker.id, worker.jobRole, shift),
+        reliability: reliabilityOf(worker.orgId),
       });
     }
     out.sort((a, b) => (b.yourAverageRating ?? 0) - (a.yourAverageRating ?? 0) || (a.distanceKm ?? 1e9) - (b.distanceKm ?? 1e9));

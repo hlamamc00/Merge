@@ -1,4 +1,4 @@
-import { and, eq, gt, inArray, isNull, lte, sql } from 'drizzle-orm';
+import { and, eq, gt, inArray, isNotNull, isNull, lte, sql } from 'drizzle-orm';
 import {
   CapacityFlagKind,
   JOB_ROLE_LABELS,
@@ -32,6 +32,8 @@ export function loadDispatchOrgs(db: Db, hostOrgId: string, now: Date): Dispatch
   return orgs.map((o) => {
     const hostRel = rels.find((r) => r.orgId === hostOrgId && r.otherOrgId === o.id);
     const orgRel = rels.find((r) => r.orgId === o.id && r.otherOrgId === hostOrgId);
+    // Decision 4: an organisation serving a no-show penalty gets no priority from its surplus flags.
+    const penalised = isPriorityPenalised(o, now);
     return {
       id: o.id,
       name: o.name,
@@ -42,7 +44,7 @@ export function loadDispatchOrgs(db: Db, hostOrgId: string, now: Date): Dispatch
       hostRelationship: (hostRel?.kind as RelationshipKind | undefined) ?? null,
       orgRelationshipToHost: (orgRel?.kind as RelationshipKind | undefined) ?? null,
       surplusFlags: flags
-        .filter((f) => f.orgId === o.id)
+        .filter((f) => f.orgId === o.id && !penalised)
         .map((f) => ({
           id: f.id,
           jobRole: f.jobRole,
@@ -56,6 +58,10 @@ export function loadDispatchOrgs(db: Db, hostOrgId: string, now: Date): Dispatch
         })),
     };
   });
+}
+
+export function isPriorityPenalised(org: { priorityPenaltyUntil: Date | null }, now: Date): boolean {
+  return !!org.priorityPenaltyUntil && org.priorityPenaltyUntil.getTime() > now.getTime();
 }
 
 export function toDispatchShift(shift: Shift, site: Site, publishedAt: Date): DispatchShiftInput {
@@ -76,7 +82,21 @@ export function toDispatchShift(shift: Shift, site: Site, publishedAt: Date): Di
 
 export function buildPlan(db: Db, settings: PlatformSettingsRow, shift: Shift, site: Site, publishedAt: Date, now: Date): DispatchPlan {
   const orgs = loadDispatchOrgs(db, shift.hostOrgId, now);
-  return planDispatch(toDispatchShift(shift, site, publishedAt), orgs, dispatchSettingsFrom(settings));
+  const plan = planDispatch(toDispatchShift(shift, site, publishedAt), orgs, dispatchSettingsFrom(settings));
+  // Say why a penalised organisation with a live surplus flag is sitting in the network tier.
+  const penalised = db
+    .select({ id: organisations.id, until: organisations.priorityPenaltyUntil })
+    .from(organisations)
+    .where(and(isNotNull(organisations.priorityPenaltyUntil), gt(organisations.priorityPenaltyUntil, now)))
+    .all();
+  if (penalised.length === 0) return plan;
+  const untilById = new Map(penalised.map((p) => [p.id, p.until!]));
+  return {
+    ...plan,
+    entries: plan.entries.map((e) =>
+      e.tier === 'NETWORK' && untilById.has(e.orgId) ? { ...e, reason: `Network (priority access suspended until ${untilById.get(e.orgId)!.toISOString().slice(0, 10)} after repeated no-shows)` } : e,
+    ),
+  };
 }
 
 /** Replace the persisted access rows for a shift with a fresh plan. */

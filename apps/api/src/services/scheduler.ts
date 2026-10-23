@@ -3,8 +3,11 @@ import { DOCUMENT_LABELS, NotificationType, addDays } from '@merge/shared';
 import type { Db } from '../db/client.js';
 import { notifications, workerDocuments, workers } from '../db/schema.js';
 import type { Notifier } from '../lib/notify.js';
+import { remindOperatorOfPendingRequests } from './assignments.js';
 import { expireFlags } from './capacity.js';
 import { notifyDueAccess } from './dispatch.js';
+import { runEscalations } from './escalation.js';
+import { getSettings } from './settings.js';
 import { progressShifts, warnUnfilledSoon } from './shifts.js';
 
 export interface TickResult {
@@ -13,6 +16,10 @@ export interface TickResult {
   shifts: { started: number; completed: number; expired: number };
   unfilledWarnings: number;
   documentAlerts: number;
+  /** Decision 6: shifts escalated automatically, and hosts prompted to escalate manually. */
+  escalations: { auto: number; prompted: number };
+  /** Decision 7: pending requests the platform owner was asked to chase. */
+  operatorReminders: number;
 }
 
 /** One pass of the background jobs. Idempotent, so it is safe to run as often as you like. */
@@ -20,9 +27,12 @@ export function tick(db: Db, notifier: Notifier, now: Date): TickResult {
   const shiftsResult = progressShifts(db, notifier, now);
   const stagesOpened = notifyDueAccess(db, notifier, now);
   const flagsExpired = expireFlags(db, now);
+  const settings = getSettings(db);
+  const escalations = runEscalations(db, notifier, settings, now);
   const unfilledWarnings = warnUnfilledSoon(db, notifier, now);
+  const operatorReminders = remindOperatorOfPendingRequests(db, notifier, settings, now);
   const documentAlerts = alertExpiringDocuments(db, notifier, now);
-  return { stagesOpened, flagsExpired, shifts: shiftsResult, unfilledWarnings, documentAlerts };
+  return { stagesOpened, flagsExpired, shifts: shiftsResult, unfilledWarnings, documentAlerts, escalations, operatorReminders };
 }
 
 /** Tell employers about documents expiring in the next 30 days (at most one alert per document per week). */
@@ -67,7 +77,7 @@ export function startScheduler(db: Db, notifier: Notifier, intervalSeconds: numb
   const run = () => {
     try {
       const r = tick(db, notifier, now());
-      if (r.stagesOpened || r.flagsExpired || r.shifts.started || r.shifts.completed || r.shifts.expired || r.unfilledWarnings || r.documentAlerts) {
+      if (r.stagesOpened || r.flagsExpired || r.shifts.started || r.shifts.completed || r.shifts.expired || r.unfilledWarnings || r.documentAlerts || r.escalations.auto || r.escalations.prompted || r.operatorReminders) {
         log(`scheduler: ${JSON.stringify(r)}`);
       }
     } catch (err) {
