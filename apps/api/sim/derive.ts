@@ -9,12 +9,14 @@ const med = (xs: number[]) => {
   return s[Math.floor(s.length / 2)]!;
 };
 
-export function deriveGapsFromWeeks(gaps: GapRegister, weeks: WeekStats[]): void {
+export function deriveGapsFromWeeks(gaps: GapRegister, weeks: WeekStats[], extra: { workerRequests?: number } = {}): void {
   // Self-service workers are shown shifts they cannot take.
   const workerRefusals = sum(weeks.map((w) => Object.entries(w.apiErrors).filter(([k]) => k.includes('requests (worker)')).reduce((s, [, v]) => s + v, 0)));
   const reasons = new Map<string, number>();
   for (const w of weeks) for (const [k, v] of Object.entries(w.requestsRefused)) if (k.startsWith('worker:')) reasons.set(k.slice(7), (reasons.get(k.slice(7)) ?? 0) + v);
-  const attempts = sum(weeks.map((w) => w.confirmations)); // proxy for scale
+  const topReasons = [...reasons.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4).map(([k, v]) => `${k} ${v}`).join(', ');
+  const flaggedRows = sum([...reasons.values()]);
+  const requests = extra.workerRequests ?? 0;
   if (workerRefusals >= 20) {
     gaps.record({
       id: 'DSP-08',
@@ -23,12 +25,24 @@ export function deriveGapsFromWeeks(gaps: GapRegister, weeks: WeekStats[]): void
       severity: 'medium',
       persona: 'care worker (phone)',
       month: 1,
-      evidence: `Self-service workers had ${workerRefusals} requests refused after choosing a shift from their own board (top reasons: ${[...reasons.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4).map(([k, v]) => `${k} ${v}`).join(', ')}). The worker board filters by role only; skills, compliance, rest and weekly hours are checked only when they press Request.`,
+      evidence: `Self-service workers had ${workerRefusals} requests refused after choosing a shift from their own board (top reasons: ${topReasons}). The worker board filters by role only; skills, compliance, rest and weekly hours are checked only when they press Request.`,
       impact: 'The first thing a worker learns about the app is a rejection; they stop using it.',
       proposal: 'Evaluate eligibility server-side for the worker view and show only shifts they can take, with the blocked ones (and why) in a separate "not eligible" list.',
     });
+  } else if (requests > 0) {
+    gaps.record({
+      id: 'DSP-08',
+      title: 'The worker board marks each shift eligible or not before it is requested',
+      category: 'Shifts & dispatch',
+      severity: 'medium',
+      persona: 'care worker (phone)',
+      month: 1,
+      status: 'fixed',
+      evidence: `Self-service workers made ${requests.toLocaleString()} requests from their own board and only ${workerRefusals} were refused by the server. The board evaluates each row for the worker (eligible, blockers, warnings, distance), so the ${flaggedRows.toLocaleString()} rows it marked not eligible over the run (top reasons: ${topReasons || 'none'}) were never requested.`,
+      impact: 'A worker\'s first experience is a shift they can take, not a rejection.',
+      proposal: 'Keep: per-row eligibility on the worker board; a separate "not eligible (and why)" list is a UI matter.',
+    });
   }
-  void attempts;
 }
 
 export interface Observation {

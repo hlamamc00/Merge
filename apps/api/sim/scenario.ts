@@ -65,7 +65,39 @@ export interface SimOrg {
   blockedBy: string[];
   /** How the staff were loaded and what it cost; null for the agency (its bank is created at bootstrap). */
   onboarding: { method: 'import' | 'one-by-one'; staff: number; apiCalls: number } | null;
+  /** Decision 10: a manager limited to the first site, kept so the record can be checked later (ONB-03). */
+  siteManagerToken?: string;
 }
+
+/** An email the platform sent, as the simulated person would see it in their inbox. */
+export interface OutboundMail {
+  to: string;
+  subject: string | null;
+  body: string;
+  createdAt: number;
+}
+
+/**
+ * Run-wide counters behind the "verified fixed" evidence. Each probe re-records its gap with the
+ * cumulative figures, so the final register carries the whole run's numbers.
+ */
+export const runTotals = {
+  invited: 0,
+  accepted: 0,
+  bulkConfirmCalls: 0,
+  bulkConfirmed: 0,
+  bulkApproveCalls: 0,
+  bulkApproved: 0,
+  hostInvoices: 0,
+  hostInvoiceValue: 0,
+  remittances: 0,
+  remittanceValue: 0,
+  hostPaymentsRecorded: 0,
+  markedOverdue: 0,
+  financeReminders: 0,
+  creditHoldsApplied: 0,
+  autoApproved: 0,
+};
 
 export interface PendingPost {
   postAt: Date;
@@ -92,6 +124,8 @@ export interface SimContext {
   stats: Stats;
   /** The simulated person reads their email: latest outbound message body sent to this address, if any. */
   mailbox: (email: string) => string | null;
+  /** How many emails the platform has sent that match (for probes that check a message reached someone). */
+  countEmails: (predicate: (m: OutboundMail) => boolean) => number;
 }
 
 export interface WeekStats {
@@ -192,6 +226,8 @@ export class World {
   floorRate = 0;
   /** Which of the phase-1 endpoints exist on the API under test (detected on first use). */
   features: Record<string, boolean> = {};
+  /** Checks that could not be settled when first met and are re-read at the end of the run. */
+  deferred: { cmp02?: { orgName: string; blocked: number; renewed: number; month: number } } = {};
   /** shiftId → details we need later without refetching */
   shifts = new Map<string, { hostOrgId: string; publishedAt: Date; startsAt: Date; endsAt: Date; headcount: number; group: RoleGroup; urgent: boolean }>();
   providers(): SimOrg[] {
@@ -382,20 +418,51 @@ export async function onboardProvider(ctx: SimContext, spec: ProviderSpec): Prom
   const calls = api.calls.length - callsBefore;
   org.onboarding = { method: imported ? 'import' : 'one-by-one', staff: spec.staff, apiCalls: calls };
   ctx.log(`${fmtDate(clock.now)} onboarded ${spec.name} (${spec.staff} staff, ${spec.sites} site(s)) ${imported ? 'by spreadsheet import' : 'one worker at a time'}: ${calls} API calls, ${elapsedMin} min of machine time`);
+  const onb01 = {
+    id: 'ONB-01',
+    category: 'Onboarding' as const,
+    severity: 'blocker' as const,
+    persona: 'HR manager at a large provider',
+    month: Math.floor((clock.now.getTime() - SIM_START.getTime()) / DAY / 30),
+    impact: 'Large providers will not finish onboarding; the platform only gets a handful of their staff, which starves the exchange of supply.',
+    proposal: 'CSV/Excel import of workers (name, email, role, skills, contracted hours, postcode, document references and expiry dates) with a preview, validation report and partial-success handling; bulk verification; and an export of the same shape so providers can round-trip from their HR or rota system.',
+  };
   if (spec.staff >= 40 && !imported) {
     gaps.record({
-      id: 'ONB-01',
+      ...onb01,
       title: 'No bulk import: every worker and every document is added one at a time',
-      category: 'Onboarding',
-      severity: 'blocker',
-      persona: 'HR manager at a large provider',
-      month: Math.floor(((clock.now.getTime() - SIM_START.getTime()) / DAY) / 30),
       evidence: `${spec.name} with ${spec.staff} staff needed ${calls} API calls (one worker + ${requiredDocumentsForRole('CARE_ASSISTANT').length}–8 documents + a verification each). A human doing this through the UI would type each worker and each certificate by hand.`,
-      impact: 'Large providers will not finish onboarding; the platform only gets a handful of their staff, which starves the exchange of supply.',
-      proposal: 'CSV/Excel import of workers (name, email, role, skills, contracted hours, postcode, document references and expiry dates) with a preview, validation report and partial-success handling; bulk verification; and an export of the same shape so providers can round-trip from their HR or rota system.',
+    });
+  } else if (imported) {
+    // Compare what the two routes cost per worker across every employer onboarded so far.
+    const by = (method: 'import' | 'one-by-one') => {
+      const ps = world.orgs.filter((o) => o.onboarding?.method === method && o.onboarding.staff > 0);
+      const staff = ps.reduce((s, o) => s + o.onboarding!.staff, 0);
+      const c = ps.reduce((s, o) => s + o.onboarding!.apiCalls, 0);
+      return { orgs: ps.length, staff, perWorker: staff ? round1(c / staff) : 0 };
+    };
+    const imp = by('import');
+    const one = by('one-by-one');
+    gaps.record({
+      ...onb01,
+      title: 'Bulk import: a spreadsheet loads workers, documents and invitations in a few calls',
+      status: 'fixed',
+      evidence: `Spreadsheet import cost ${imp.perWorker} API calls per worker (${imp.orgs} employer(s), ${imp.staff.toLocaleString()} staff: registration, sites, template, preview, apply, bulk verification and every invitation accepted)${one.orgs ? ` against ${one.perWorker} per worker when added one at a time (${one.orgs} employer(s), ${one.staff.toLocaleString()} staff)` : ''}. ${spec.name} loaded ${spec.staff} staff with ${calls} calls; ${runTotals.invited} workers have been invited by email across the run and ${runTotals.accepted} accepted.`,
     });
   }
-  if (spec.sites >= 3) {
+  if (spec.sites >= 3) await probeSiteScopedManager(ctx, org);
+  return org;
+}
+
+/**
+ * Decision 10 (ONB-03): a group invites a home manager limited to its first site. As that manager, the rota
+ * must show only that site and posting to another site must be refused.
+ */
+async function probeSiteScopedManager(ctx: SimContext, org: SimOrg): Promise<void> {
+  const { api, gaps, clock, rng, world } = ctx;
+  const home = org.sites[0]!;
+  const other = org.sites[1]!;
+  const open = (what: string) =>
     gaps.record({
       id: 'ONB-03',
       title: 'No site-level roles: a multi-site group gives every manager access to every site',
@@ -403,20 +470,55 @@ export async function onboardProvider(ctx: SimContext, spec: ProviderSpec): Prom
       severity: 'high',
       persona: 'Regional manager of a care group',
       month: 0,
-      evidence: `${spec.name} has ${spec.sites} sites but one organisation; its rota manager login sees and can act on all of them.`,
+      evidence: `${org.name} has ${org.sites.length} sites but one organisation. ${what}`,
       impact: 'Groups cannot delegate to home managers safely; either they share one login or they register each home as a separate organisation and lose group-level reporting and internal-first dispatch.',
       proposal: 'Scope ORG_MANAGER to one or more sites; group-level admins see everything. Alternatively an organisation hierarchy (group → homes) with an internal-first dispatch stage.',
-      decisionNeeded: 'Should a care group be one organisation with site-scoped managers, or a parent organisation with child organisations that can still trade internally first?',
     });
-  }
-  return org;
+  const email = `manager.${home.name.toLowerCase().replace(/[^a-z]+/g, '-')}@${org.name.toLowerCase().replace(/[^a-z]+/g, '-')}.example`;
+  const invite = await api.task('Invite a home manager', 'group admin', () => api.post('/api/v1/onboarding/invitations', org.adminToken, { email, role: 'ORG_MANAGER', firstName: 'Home', lastName: 'Manager', siteIds: [home.id] }));
+  if (invite.status !== 201) return open(`Inviting a manager limited to ${home.name} failed: HTTP ${invite.status} (${invite.body?.error ?? 'no invitation endpoint'}); its rota manager login sees and can act on all of them.`);
+  api.countTask('Invite a home manager');
+  const token = ctx.mailbox(email)?.match(/\/invite\/([A-Za-z0-9_-]+)/)?.[1];
+  const accept = token ? await api.task('Manager accepts an invitation', 'home manager', () => api.post(`/api/v1/onboarding/invitations/${token}/accept`, null, { password: `Welcome-${rng.int(100000, 999999)}-ok` })) : null;
+  if (!accept || accept.status !== 200 || !accept.body?.token) return open(`The home manager's invitation email ${token ? `could not be accepted (HTTP ${accept?.status})` : 'never arrived'}.`);
+  api.countTask('Manager accepts an invitation');
+  org.siteManagerToken = accept.body.token as string;
+  // Two drafts, one per site, so the rota has something to filter on the day the group joins.
+  const draft = (site: SimSite, tokenFor: string) =>
+    api.post('/api/v1/shifts', tokenFor, { siteId: site.id, jobRole: 'CARE_ASSISTANT', title: `Draft – ${site.name}`, startsAt: iso(clock.plusDays(10)), endsAt: iso(new Date(clock.plusDays(10).getTime() + 8 * HOUR)), breakMinutes: 30, headcount: 1, requiredSkills: ['MOVING_AND_HANDLING'], chargeRate: Math.max(BASE_RATE.CARE, world.floorRate), publish: false });
+  const homeDraft = await api.task('Prepare a draft shift', 'group admin', () => draft(home, org.adminToken));
+  const otherDraft = await api.task('Prepare a draft shift', 'group admin', () => draft(other, org.adminToken));
+  const rota = await api.task('Home manager reviews the rota', 'home manager', () => api.get('/api/v1/shifts?scope=posted', org.siteManagerToken!));
+  const rows = (rota.body as any[]) ?? [];
+  const offSite = rows.filter((s) => s.siteId !== home.id);
+  const denied = await api.task('Home manager posts for another site', 'home manager', () => draft(other, org.siteManagerToken!));
+  const allowed = await api.task('Home manager posts for their site', 'home manager', () => draft(home, org.siteManagerToken!));
+  const staff = await api.task('Home manager reviews staff', 'home manager', () => api.get('/api/v1/workers', org.siteManagerToken!));
+  const staffOffSite = ((staff.body as any[]) ?? []).filter((w) => w.homeSiteId && w.homeSiteId !== home.id);
+  for (const d of [homeDraft, otherDraft, allowed]) if (d.status === 201) await api.post(`/api/v1/shifts/${d.body.id}/cancel`, org.adminToken, { reason: 'Access check only' });
+  const ok = rota.status === 200 && rows.length >= 1 && offSite.length === 0 && denied.status === 403 && allowed.status === 201 && staff.status === 200 && staffOffSite.length === 0;
+  if (!ok) return open(`A manager invited for ${home.name} only: GET /shifts?scope=posted → ${rota.status} with ${rows.length} rows (${offSite.length} from other sites); POST /shifts for ${other.name} → ${denied.status} (expected 403); for ${home.name} → ${allowed.status}; GET /workers → ${staff.status} with ${staffOffSite.length} worker(s) based elsewhere.`);
+  gaps.record({
+    id: 'ONB-03',
+    title: 'Site-scoped managers: a group invites a home manager who sees and acts on their own site only',
+    category: 'Workforce',
+    severity: 'high',
+    persona: 'Regional manager of a care group',
+    month: 0,
+    status: 'fixed',
+    evidence: `${org.name} (${org.sites.length} sites) invited a manager limited to ${home.name} by email; after accepting, their rota showed ${rows.length} shift(s), all at that site (the group's ${other.name} draft was hidden), POST /shifts for ${other.name} was refused (403) while their own site's was accepted (201), and GET /workers listed only staff based at ${home.name} or unassigned (${((staff.body as any[]) ?? []).length} rows, 0 elsewhere). The group admin still sees everything; moving staff between a group's own homes stays outside Merge (decision 10).`,
+    impact: 'Groups can delegate to home managers without sharing one login or splitting into separate organisations.',
+    proposal: 'Keep: ORG_MANAGER scoped to one or more sites; group-level admins see everything.',
+  });
 }
 
 export const SIM_START = new Date('2026-11-02T06:00:00Z'); // a Monday
 
 async function addWorkers(ctx: SimContext, org: SimOrg, count: number, opts: { loginShare: number; nurses?: boolean }): Promise<void> {
-  const { api, rng, clock, gaps } = ctx;
+  const { api, rng, clock, gaps, world } = ctx;
   let unverifiedBacklog = 0;
+  let invited = 0;
+  let accepted = 0;
   for (let i = 0; i < count; i++) {
     const group: RoleGroup = rng.weighted([
       { v: 'CARE' as RoleGroup, w: opts.nurses ? 65 : 78 },
@@ -467,16 +569,42 @@ async function addWorkers(ctx: SimContext, org: SimOrg, count: number, opts: { l
 
     if (rng.chance(opts.loginShare)) {
       const email = `${name.firstName}.${name.lastName}.${rng.int(100, 999)}@${org.name.toLowerCase().replace(/[^a-z]+/g, '-')}.example`.toLowerCase();
-      const login = await api.task('Create a worker login', 'HR / rota manager', () => api.post(`/api/v1/workers/${worker.id}/login`, org.adminToken, { email, password: 'Temp-Pass-1234' }));
-      api.countTask('Create a worker login');
-      if (login.status === 201) {
-        const session = await api.task('Log in', 'care worker', () => api.post('/api/v1/auth/login', null, { email, password: 'Temp-Pass-1234' }));
-        worker.token = session.body.token;
-        worker.email = email;
+      if (world.features.invitations !== false) {
+        // Decision ONB-02: the manager sends an invitation; the worker opens the email and sets their own password.
+        const invite = await api.task('Invite a worker by email', 'HR / rota manager', () => api.post('/api/v1/onboarding/invitations', org.adminToken, { email, role: 'WORKER', firstName: name.firstName, lastName: name.lastName, workerId: worker.id }));
+        if (invite.status === 404) world.features.invitations = false;
+        else {
+          api.countTask('Invite a worker by email');
+          if (invite.status === 201) {
+            world.features.invitations = true;
+            invited++;
+            runTotals.invited++;
+            const token = ctx.mailbox(email)?.match(/\/invite\/([A-Za-z0-9_-]+)/)?.[1];
+            if (token) {
+              const res = await api.task('Worker accepts an invitation', 'care worker (phone)', () => api.post(`/api/v1/onboarding/invitations/${token}/accept`, null, { password: `Welcome-${rng.int(100000, 999999)}-ok` }));
+              api.countTask('Worker accepts an invitation');
+              if (res.status === 200 && res.body?.token) {
+                worker.token = res.body.token;
+                worker.email = email;
+                accepted++;
+                runTotals.accepted++;
+              }
+            }
+          }
+        }
+      }
+      if (world.features.invitations === false) {
+        const login = await api.task('Create a worker login', 'HR / rota manager', () => api.post(`/api/v1/workers/${worker.id}/login`, org.adminToken, { email, password: 'Temp-Pass-1234' }));
+        api.countTask('Create a worker login');
+        if (login.status === 201) {
+          const session = await api.task('Log in', 'care worker', () => api.post('/api/v1/auth/login', null, { email, password: 'Temp-Pass-1234' }));
+          worker.token = session.body.token;
+          worker.email = email;
+        }
       }
     }
   }
-  if (count >= 10 && !ctx.world.features.invitations) {
+  if (count >= 10 && world.features.invitations === false) {
     gaps.record({
       id: 'ONB-02',
       title: 'Worker logins are created by hand with a password the manager must pass on',
@@ -489,19 +617,61 @@ async function addWorkers(ctx: SimContext, org: SimOrg, count: number, opts: { l
       proposal: 'Invite-by-email (also from the import): the worker sets their own password through a time-limited link; add forgotten-password reset and a forced change on first login. Needs an email channel.',
       decisionNeeded: 'Which email provider (e.g. SendGrid, Postmark, SES) and sender domain should platform emails use?',
     });
+  } else if (invited > 0) {
+    gaps.record({
+      id: 'ONB-02',
+      title: 'Worker logins are created by email invitation; the worker sets their own password',
+      category: 'Onboarding',
+      severity: 'high',
+      persona: 'HR manager',
+      month: 0,
+      status: 'fixed',
+      evidence: `${org.name} invited ${invited} worker(s) by email and ${accepted} opened the link and chose a password; across the run ${runTotals.invited} invitations were sent (by hand and from imports) and ${runTotals.accepted} accepted. No manager chose or passed on a password; forgotten-password reset and a forced change on first login exist. The email provider and sender domain are still to be chosen at deployment (decision 15).`,
+      impact: 'No passwords travel by WhatsApp or paper, and locked-out workers can help themselves.',
+      proposal: 'Keep: invitation and reset tokens delivered by email, single use, with expiry.',
+    });
   }
   if (unverifiedBacklog > 0) {
-    gaps.record({
-      id: 'CMP-01',
-      title: 'Verification backlog is invisible: unverified documents silently block workers',
-      category: 'Compliance',
-      severity: 'medium',
-      persona: 'Compliance officer',
-      month: 0,
-      evidence: `${org.name} ended onboarding with ${unverifiedBacklog} document(s) never verified; those workers show as non-compliant with no queue or reminder for the verifier.`,
-      impact: 'Supply is quietly lost and managers only find out when a request is refused.',
-      proposal: 'A "needs verification" queue with bulk verify, plus a weekly digest of unverified and expiring documents per organisation.',
-    });
+    // The compliance officer looks for what the sheet or the manager left unverified and clears it in one go.
+    const queue = await api.task('Review verification queue', 'compliance officer', () => api.get(`/api/v1/compliance/verification-queue?orgId=${org.id}`, org.adminToken));
+    const ids = queue.status === 200 ? ((queue.body as any[]) ?? []).map((d) => d.document?.id ?? d.id).filter(Boolean) : [];
+    let verifyCalls = 0;
+    let verified = 0;
+    if (queue.status === 200) {
+      api.countTask('Review verification queue');
+      for (let i = 0; i < ids.length; i += 200) {
+        const res = await api.task('Verify documents in bulk', 'compliance officer', () => api.post('/api/v1/compliance/verify', org.adminToken, { documentIds: ids.slice(i, i + 200) }));
+        api.countTask('Verify documents in bulk');
+        verifyCalls++;
+        verified += res.status === 200 ? (res.body?.verified?.length ?? ids.slice(i, i + 200).length) : 0;
+      }
+    }
+    if (queue.status === 200 && ids.length >= unverifiedBacklog) {
+      gaps.record({
+        id: 'CMP-01',
+        title: 'A verification queue shows what is unverified and clears it in bulk',
+        category: 'Compliance',
+        severity: 'medium',
+        persona: 'Compliance officer',
+        month: 0,
+        status: 'fixed',
+        evidence: `${org.name} ended onboarding with ${unverifiedBacklog} document(s) never verified; GET /compliance/verification-queue listed ${ids.length} and POST /compliance/verify cleared ${verified} in ${verifyCalls} call(s), so no worker stays blocked without the officer knowing. Expiring documents have their own horizon report (GET /compliance/expiring).`,
+        impact: 'Supply is no longer quietly lost to a backlog nobody can see.',
+        proposal: 'Keep: the queue and bulk verify; a weekly digest of unverified and expiring documents per organisation would round it off.',
+      });
+    } else {
+      gaps.record({
+        id: 'CMP-01',
+        title: 'Verification backlog is invisible: unverified documents silently block workers',
+        category: 'Compliance',
+        severity: 'medium',
+        persona: 'Compliance officer',
+        month: 0,
+        evidence: `${org.name} ended onboarding with ${unverifiedBacklog} document(s) never verified; those workers show as non-compliant with no queue or reminder for the verifier (GET /compliance/verification-queue → ${queue.status}${queue.status === 200 ? ` with ${ids.length} rows` : ''}).`,
+        impact: 'Supply is quietly lost and managers only find out when a request is refused.',
+        proposal: 'A "needs verification" queue with bulk verify, plus a weekly digest of unverified and expiring documents per organisation.',
+      });
+    }
   }
 }
 
@@ -673,18 +843,44 @@ export async function supplierCheck(ctx: SimContext, org: SimOrg): Promise<void>
       if (req.status === 422) for (const b of req.body?.details?.blockers ?? []) stats.refused(`late:${b.code}`);
     }
   }
-  if (open.length > 25 && org.size !== 'large') {
-    gaps.record({
-      id: 'DSP-05',
-      title: 'The shift board is a flat list with no sort by fit, distance or pay',
-      category: 'Shifts & dispatch',
-      severity: 'medium',
-      persona: 'rota manager at a supplier',
-      month: monthOf(clock.now),
-      evidence: `${org.name} saw ${open.length} open shifts at once; the API returns them ordered by release time only, and finding which ones its staff can actually cover means opening each one.`,
-      impact: 'Suppliers respond to the first few and miss better matches; priority organisations waste their window.',
-      proposal: 'Board filters and sorting by role fit, distance, rate, start time; a per-organisation "you have N eligible workers" count computed server-side; saved searches and alerts.',
-    });
+  if (open.length > 25 && org.size !== 'large' && !gaps.gaps.has('DSP-05')) {
+    // A busy board: the manager narrows it to what is near and sorts by distance (widening once when nothing is close).
+    let radius = 30;
+    let near = await api.task('Sort the board by distance', 'rota manager', () => api.get(`/api/v1/shifts?scope=available&sort=distance&nearKm=${radius}`, org.managerToken));
+    if (near.status === 200 && ((near.body as any[]) ?? []).length === 0) {
+      radius = 60;
+      near = await api.task('Sort the board by distance', 'rota manager', () => api.get(`/api/v1/shifts?scope=available&sort=distance&nearKm=${radius}`, org.managerToken));
+    }
+    const rows = near.status === 200 ? ((near.body as any[]) ?? []) : [];
+    const withDistance = rows.filter((r) => typeof r.distanceKm === 'number');
+    if (near.status === 200 && rows.length > 0 && withDistance.length === rows.length) {
+      api.countTask('Sort the board by distance');
+      const sorted = withDistance.every((r, i) => i === 0 || r.distanceKm >= withDistance[i - 1]!.distanceKm);
+      gaps.record({
+        id: 'DSP-05',
+        title: 'The shift board sorts by distance, rate or start and filters to a radius',
+        category: 'Shifts & dispatch',
+        severity: 'medium',
+        persona: 'rota manager at a supplier',
+        month: monthOf(clock.now),
+        status: 'fixed',
+        evidence: `${org.name} saw ${open.length} open shifts at once; GET /shifts?scope=available&sort=distance&nearKm=${radius} returned ${rows.length} within ${radius} km, every row with distanceKm (nearest ${withDistance[0]?.distanceKm} km, farthest ${withDistance[withDistance.length - 1]?.distanceKm} km${sorted ? ', in order' : ''}), and sort=opens|start|rate are available too. Worker logins see eligible/blockers on each row.`,
+        impact: 'Suppliers find the shifts their staff can cover first instead of opening each one.',
+        proposal: 'Keep: board sorting and radius; a per-organisation "you have N eligible workers" count and saved searches would round it off.',
+      });
+    } else {
+      gaps.record({
+        id: 'DSP-05',
+        title: 'The shift board is a flat list with no sort by fit, distance or pay',
+        category: 'Shifts & dispatch',
+        severity: 'medium',
+        persona: 'rota manager at a supplier',
+        month: monthOf(clock.now),
+        evidence: `${org.name} saw ${open.length} open shifts at once; sorting by distance within ${radius} km returned HTTP ${near.status} with ${rows.length} rows, ${withDistance.length} carrying a distance. The board is ordered by release time only, and finding which ones its staff can actually cover means opening each one.`,
+        impact: 'Suppliers respond to the first few and miss better matches; priority organisations waste their window.',
+        proposal: 'Board filters and sorting by role fit, distance, rate, start time; a per-organisation "you have N eligible workers" count computed server-side; saved searches and alerts.',
+      });
+    }
   }
 }
 
@@ -722,10 +918,10 @@ export async function hostCheck(ctx: SimContext, org: SimOrg): Promise<void> {
   api.countTask('Review incoming requests');
   if (incoming.status !== 200) return;
   const requests = incoming.body as any[];
+  // First come, first served per shift, confirmed in one action.
+  const chosen: string[] = [];
+  const seen = new Map<string, number>();
   if (requests.length >= 5 && world.features.bulkConfirm !== false) {
-    // First come, first served per shift, confirmed in one action.
-    const chosen: string[] = [];
-    const seen = new Map<string, number>();
     for (const r of [...requests].sort((a, b) => new Date(a.requestedAt).getTime() - new Date(b.requestedAt).getTime())) {
       const cap = world.shifts.get(r.shiftId)?.headcount ?? 1;
       const n = seen.get(r.shiftId) ?? 0;
@@ -734,16 +930,37 @@ export async function hostCheck(ctx: SimContext, org: SimOrg): Promise<void> {
         seen.set(r.shiftId, n + 1);
       }
     }
+  }
+  if (chosen.length > 0) {
     const bulk = await api.task('Confirm requests in bulk', 'rota manager', () => api.post('/api/v1/assignments/bulk', org.managerToken, { ids: chosen, action: 'confirm' }));
     if (bulk.status === 404) world.features.bulkConfirm = false;
     else {
       api.countTask('Confirm requests in bulk');
       world.features.bulkConfirm = true;
+      let okCount = 0;
       for (const res of (bulk.body?.results as any[]) ?? []) {
-        if (!res.ok) continue;
+        if (!res.ok) {
+          if (res.details?.code === 'NO_LONGER_ELIGIBLE') stats.refused('late:NO_LONGER_ELIGIBLE');
+          continue;
+        }
+        okCount++;
         const r = requests.find((x) => x.id === res.id);
         if (r) recordConfirmation(ctx, r, { ...r, status: 'CONFIRMED' });
       }
+      runTotals.bulkConfirmCalls++;
+      runTotals.bulkConfirmed += okCount;
+      gaps.record({
+        id: 'DSP-02',
+        title: 'Bulk confirm: a host answers a sitting of requests in one action',
+        category: 'Shifts & dispatch',
+        severity: 'high',
+        persona: 'rota manager at a host',
+        month: monthOf(clock.now),
+        status: 'fixed',
+        evidence: `${org.name} had ${requests.length} pending requests at one check and confirmed ${okCount} of ${chosen.length} chosen in a single POST /assignments/bulk (rows that were no longer eligible came back with their blockers instead of a booking). Across the run ${runTotals.bulkConfirmed} requests were confirmed in ${runTotals.bulkConfirmCalls} bulk calls (${round1(runTotals.bulkConfirmed / runTotals.bulkConfirmCalls)} per call); each confirmation re-checks eligibility first.`,
+        impact: 'Winter weeks no longer pile up hundreds of clicks; workers put forward hear back at the host\'s next check.',
+        proposal: 'Keep: bulk confirm/decline grouped per shift; optional auto-confirm per host already exists.',
+      });
       return;
     }
   }
@@ -914,7 +1131,7 @@ export async function afterShifts(ctx: SimContext, org: SimOrg): Promise<void> {
       }
     }
   }
-  if (submitted >= 20) {
+  if (submitted >= 20 && ctx.world.features.bulkApprove === false) {
     gaps.record({
       id: 'FIN-02',
       title: 'Timesheets are submitted and approved one at a time',
@@ -932,26 +1149,65 @@ export async function afterShifts(ctx: SimContext, org: SimOrg): Promise<void> {
 
 /** Hosts approve or dispute submitted timesheets at their checks. */
 export async function hostApprovals(ctx: SimContext, org: SimOrg): Promise<void> {
-  const { api, rng, stats } = ctx;
+  const { api, rng, stats, world, gaps, clock } = ctx;
   if (!rng.chance(org.responsiveness * 0.7)) return;
   const payable = await api.task('Review submitted timesheets', 'finance clerk', () => api.get('/api/v1/timesheets?scope=payable&status=SUBMITTED', org.managerToken));
   api.countTask('Review submitted timesheets');
-  for (const ts of (payable.body as any[]) ?? []) {
+  const rows = (payable.body as any[]) ?? [];
+  let toApprove: any[] = [];
+  const toDispute: any[] = [];
+  for (const ts of rows) {
     const roll = rng.next();
-    if (roll < 0.9) {
-      const r = await api.task('Approve a timesheet', 'finance clerk', () => api.post(`/api/v1/timesheets/${ts.id}/approve`, org.managerToken));
-      api.countTask('Approve a timesheet');
-      if (r.status === 200) {
+    if (roll < 0.9) toApprove.push(ts);
+    else if (roll < 0.95) toDispute.push(ts);
+  }
+  // A sitting of five or more: the clerk signs the clean ones off in one action and looks at the rest one by one.
+  if (toApprove.length >= 5 && world.features.bulkApprove !== false) {
+    const bulk = await api.task('Approve timesheets in bulk', 'finance clerk', () => api.post('/api/v1/timesheets/bulk-approve', org.managerToken, { ids: toApprove.map((t) => t.id) }));
+    if (bulk.status === 404) world.features.bulkApprove = false;
+    else {
+      api.countTask('Approve timesheets in bulk');
+      world.features.bulkApprove = true;
+      const okIds = new Set(((bulk.body?.results as any[]) ?? []).filter((r) => r.ok).map((r) => r.id as string));
+      for (const ts of toApprove) {
+        if (!okIds.has(ts.id)) continue;
         stats.current.timesheetsApproved++;
-        stats.current.hoursTraded += r.body.paidHours;
-        stats.current.chargeTraded += r.body.hostCost;
-        stats.current.platformFee += r.body.platformFee;
-      } else stats.apiError(r.status, 'POST /timesheets/:id/approve');
-    } else if (roll < 0.95) {
-      const r = await api.task('Dispute a timesheet', 'finance clerk', () => api.post(`/api/v1/timesheets/${ts.id}/dispute`, org.managerToken, { reason: rng.pick(['Left early', 'Break not deducted', 'Did not attend handover']) }));
-      api.countTask('Dispute a timesheet');
-      if (r.status === 200) stats.current.timesheetsDisputed++;
+        stats.current.hoursTraded += ts.paidHours ?? 0;
+        stats.current.chargeTraded += ts.hostCost ?? 0;
+        stats.current.platformFee += ts.platformFee ?? 0;
+      }
+      runTotals.bulkApproveCalls++;
+      runTotals.bulkApproved += okIds.size;
+      const flagged = toApprove.filter((t) => (t.exceptions ?? []).length > 0).length;
+      gaps.record({
+        id: 'FIN-02',
+        title: 'Bulk approval with exceptions flagged; undecided timesheets auto-approve after 14 days',
+        category: 'Finance',
+        severity: 'high',
+        persona: 'finance clerk',
+        month: monthOf(clock.now),
+        status: 'fixed',
+        evidence: `${org.name} had ${rows.length} submitted timesheets at one sitting and approved ${okIds.size} of ${toApprove.length} in a single POST /timesheets/bulk-approve; ${flagged} row(s) carried exception flags (late clock-in, over length, missing clock-out, submitted late) for the clerk to look at first. Across the run ${runTotals.bulkApproved} timesheets were approved in ${runTotals.bulkApproveCalls} bulk calls and ${runTotals.autoApproved} were approved automatically after 14 days of host silence so remittances were not held up. Submission stays one per shift, as a clock-in and clock-out are.`,
+        impact: 'Weekly admin no longer scales with volume on the host side, and suppliers are not left waiting on a host that never looks.',
+        proposal: 'Keep: bulk approve, exception flags and the 14-day auto-approval; a weekly grid view is a UI matter.',
+      });
+      if (bulk.status === 200) toApprove = []; // rows the bulk call refused had a reason; nobody retries them one by one
     }
+  }
+  for (const ts of toApprove) {
+    const r = await api.task('Approve a timesheet', 'finance clerk', () => api.post(`/api/v1/timesheets/${ts.id}/approve`, org.managerToken));
+    api.countTask('Approve a timesheet');
+    if (r.status === 200) {
+      stats.current.timesheetsApproved++;
+      stats.current.hoursTraded += r.body.paidHours;
+      stats.current.chargeTraded += r.body.hostCost;
+      stats.current.platformFee += r.body.platformFee;
+    } else stats.apiError(r.status, 'POST /timesheets/:id/approve');
+  }
+  for (const ts of toDispute) {
+    const r = await api.task('Dispute a timesheet', 'finance clerk', () => api.post(`/api/v1/timesheets/${ts.id}/dispute`, org.managerToken, { reason: rng.pick(['Left early', 'Break not deducted', 'Did not attend handover']) }));
+    api.countTask('Dispute a timesheet');
+    if (r.status === 200) stats.current.timesheetsDisputed++;
   }
 }
 
@@ -1016,18 +1272,42 @@ export async function manageFlags(ctx: SimContext, org: SimOrg, week: number): P
   api.countTask('Check my capacity flags');
   const activeIds = new Set(((mine.body as any[]) ?? []).map((f) => f.id));
   for (const g of groups) if (org.activeSurplusFlag[g] && !activeIds.has(org.activeSurplusFlag[g])) delete org.activeSurplusFlag[g];
-  if (week > 2 && Object.keys(org.activeSurplusFlag).length === 0 && groups.some((g) => org.balance[g] >= 2)) {
-    gaps.record({
-      id: 'DSP-03',
-      title: 'Flags must be re-raised by hand every fortnight; nothing nudges a supplier whose flag lapsed',
-      category: 'Shifts & dispatch',
-      severity: 'medium',
-      persona: 'rota manager at a supplier',
-      month: monthOf(clock.now),
-      evidence: `${org.name} still had spare staff but no active flag after its previous one expired or was fulfilled, so it had dropped to network timing without noticing.`,
-      impact: 'The priority mechanism depends on managers remembering to flag; in practice flags lapse and priority goes to whoever is most diligent, not most in need.',
-      proposal: 'Expiry and fulfilment reminders, one-click re-raise, recurring flags (e.g. "every week until occupancy recovers"), and a suggestion to flag when the platform sees a supplier\'s workers repeatedly eligible but idle.',
-    });
+  if (week > 2 && Object.keys(org.activeSurplusFlag).length === 0 && groups.some((g) => org.balance[g] >= 2) && !gaps.gaps.has('DSP-03')) {
+    // Was the manager told when the flag ran out, or did it lapse silently? Only meaningful once a flag has actually expired.
+    const inbox = await api.task('Check notifications', 'rota manager', () => api.get('/api/v1/notifications?limit=200', org.managerToken));
+    api.countTask('Check notifications');
+    const expired = ((inbox.body?.notifications as any[]) ?? []).filter((n) => n.type === 'FLAG_EXPIRED');
+    const flags = await api.task('Check my capacity flags', 'rota manager', () => api.get('/api/v1/capacity/flags?kind=SURPLUS&status=EXPIRED', org.managerToken));
+    const lapsed = ((flags.body as any[]) ?? []).length;
+    if (expired.length === 0 && lapsed === 0) {
+      /* nothing has lapsed yet; look again next week */
+    } else if (expired.length > 0) {
+      const latest = expired[0];
+      gaps.record({
+        id: 'DSP-03',
+        title: 'A supplier is told when its surplus flag runs out and can re-raise it in one call',
+        category: 'Shifts & dispatch',
+        severity: 'medium',
+        persona: 'rota manager at a supplier',
+        month: monthOf(clock.now),
+        status: 'fixed',
+        evidence: `${org.name} had spare staff and no active flag; its inbox held ${expired.length} FLAG_EXPIRED notice(s), the latest "${latest.title}" on ${String(latest.createdAt).slice(0, 10)} (sent by email at once as an immediate type), so the lapse was not silent. Re-raising is one POST /capacity/flags naming the staff freed, which also records their internal hours for the fortnight.`,
+        impact: 'Priority no longer depends on a manager remembering the fortnight; it depends on them answering a reminder.',
+        proposal: 'Keep: expiry and fulfilment notices; recurring flags and a nudge when idle staff are repeatedly eligible would round it off.',
+      });
+    } else {
+      gaps.record({
+        id: 'DSP-03',
+        title: 'Flags must be re-raised by hand every fortnight; nothing nudges a supplier whose flag lapsed',
+        category: 'Shifts & dispatch',
+        severity: 'medium',
+        persona: 'rota manager at a supplier',
+        month: monthOf(clock.now),
+        evidence: `${org.name} still had spare staff but no active flag after ${lapsed} of its flags expired, so it had dropped to network timing without noticing (GET /notifications → ${inbox.status}, no FLAG_EXPIRED notice among ${((inbox.body?.notifications as any[]) ?? []).length}).`,
+        impact: 'The priority mechanism depends on managers remembering to flag; in practice flags lapse and priority goes to whoever is most diligent, not most in need.',
+        proposal: 'Expiry and fulfilment reminders, one-click re-raise, recurring flags (e.g. "every week until occupancy recovers"), and a suggestion to flag when the platform sees a supplier\'s workers repeatedly eligible but idle.',
+      });
+    }
   }
 }
 
@@ -1056,15 +1336,46 @@ export async function complianceRound(ctx: SimContext, org: SimOrg): Promise<voi
     }
   }
   stats.current.workersBlockedByCompliance = Math.max(stats.current.workersBlockedByCompliance, blocked);
-  if (blocked >= 5 && org.workers.length >= 40) {
+  if (blocked >= 5 && org.workers.length >= 40 && !ctx.world.deferred.cmp02) {
+    ctx.world.deferred.cmp02 = { orgName: org.name, blocked, renewed, month: monthOf(clock.now) };
+    recordWorkerExpiryGap(ctx, false); // settled now if it can be, otherwise at the end of the run
+  }
+}
+
+/**
+ * CMP-02: workers must hear about expiring documents themselves (their line in the daily digest) and be able to
+ * upload the renewal. A missing alert early in the run is "not yet", not a failure, so the open verdict waits
+ * until the end of the run (`final`).
+ */
+export function recordWorkerExpiryGap(ctx: SimContext, final: boolean): void {
+  const { gaps, world } = ctx;
+  const snap = world.deferred.cmp02;
+  if (!snap || gaps.gaps.has('CMP-02')) return;
+  const workerEmails = new Set(world.orgs.flatMap((o) => o.workers.map((w) => w.email)).filter((e): e is string => !!e));
+  const workerAlerts = ctx.countEmails((m) => workerEmails.has(m.to) && /• Your .+ expires (today|in \d+ day)/.test(m.body));
+  const selfUpload = world.features.workerSelfUpload === true;
+  if (selfUpload && workerAlerts > 0) {
+    gaps.record({
+      id: 'CMP-02',
+      title: 'Workers hear about expiring documents by email and can upload the renewal themselves',
+      category: 'Compliance',
+      severity: 'high',
+      persona: 'compliance officer',
+      month: snap.month,
+      status: 'fixed',
+      evidence: `${snap.orgName} had ${snap.blocked} active workers blocked by expired or missing documents at one point and the officer renewed ${snap.renewed} that round; ${workerAlerts} digest email(s) carrying a "Your … expires in N days" line reached workers' own addresses (one alert per document per week, the employer told too), and a worker's own login can add the renewed certificate for the employer to verify (checked by probe). SMS reminders wait on the provider decision (decision 15).`,
+      impact: 'The officer stops being the only route for hundreds of certificates a year.',
+      proposal: 'Keep: worker alerts and self-upload; a per-organisation expiries-by-month view (GET /compliance/expiring) exists for the dashboard.',
+    });
+  } else if (final || !selfUpload) {
     gaps.record({
       id: 'CMP-02',
       title: 'Expiry alerts only reach the employer, and only in-app; workers cannot renew themselves',
       category: 'Compliance',
       severity: 'high',
       persona: 'compliance officer',
-      month: monthOf(clock.now),
-      evidence: `${org.name} had ${blocked} active workers blocked by expired or missing documents at one point; renewals are entered by the officer after the fact (${renewed} this round) because workers have no way to upload a renewed certificate.`,
+      month: snap.month,
+      evidence: `${snap.orgName} had ${snap.blocked} active workers blocked by expired or missing documents at one point; renewals are entered by the officer after the fact (${snap.renewed} that round)${selfUpload ? '' : ' because workers have no way to upload a renewed certificate'}; ${workerAlerts} expiry email(s) reached a worker's own address over the run.`,
       impact: 'Supply is lost exactly when it is needed; the officer becomes the bottleneck for hundreds of certificates a year.',
       proposal: 'Worker self-upload with manager verification, email/SMS reminders to the worker at 60/30/7 days, and a compliance dashboard per organisation with upcoming expiries by month.',
     });
@@ -1096,6 +1407,25 @@ export async function monthEnd(ctx: SimContext, periodStart: Date, periodEnd: Da
       const host = world.org(inv.hostOrgId);
       pendingPayments.push({ invoiceId: inv.id, hostOrgId: inv.hostOrgId, dueAt: new Date(clock.now.getTime() + (host?.payLagDays ?? 30) * DAY), kind: 'host' });
     }
+    runTotals.hostInvoices += hostInvoices.length;
+    runTotals.hostInvoiceValue += hostInvoices.reduce((s, i) => s + (i.total ?? 0), 0);
+    runTotals.remittances += remittances.length;
+    runTotals.remittanceValue += remittances.reduce((s, i) => s + (i.total ?? 0), 0);
+    // Who is on credit hold this morning: the agency's finance team reads it off the directory.
+    const directory = await api.task('Review credit holds', 'agency finance', () => api.get('/api/v1/organisations', world.platformAdminToken));
+    const onHold = ((directory.body as any[]) ?? []).filter((o) => o.creditHold === true).map((o) => o.name);
+    gaps.record({
+      id: 'FIN-01',
+      title: 'Settlement: hosts are invoiced by the platform, suppliers get remittances, payments and reminders are tracked',
+      category: 'Finance',
+      severity: 'high',
+      persona: 'agency finance',
+      month: monthOf(clock.now),
+      status: 'fixed',
+      evidence: `Monthly runs so far issued ${runTotals.hostInvoices} host invoice(s) (MH-) worth £${Math.round(runTotals.hostInvoiceValue).toLocaleString()} and ${runTotals.remittances} remittance(s) (MR-) worth £${Math.round(runTotals.remittanceValue).toLocaleString()}; the platform's finance team recorded ${runTotals.hostPaymentsRecorded} host payment(s) with a bank reference (POST /finance/host-invoices/:id/mark-paid). The daily finance job marked ${runTotals.markedOverdue} invoice(s) overdue, sent ${runTotals.financeReminders} reminder(s) and applied ${runTotals.creditHoldsApplied} credit hold(s); ${onHold.length ? `${onHold.join(', ')} ${onHold.length === 1 ? 'is' : 'are'} on hold today` : 'nobody is on hold today'}. Credits net off the next invoice and remittance (decision 5); Direct Debit or card collection and an accounts-package export remain outside the platform.`,
+      impact: 'The agency sees its float, who owes what and who is late without re-keying into its accounts package.',
+      proposal: 'Keep: hosts pay the platform, the platform pays suppliers (decision 1); CSV exports exist for the accounts package.',
+    });
   }
   if (!world.features.settlement) ctx.log(`${fmtDate(clock.now)} statements for ${fmtDate(periodStart)}–${fmtDate(periodEnd)}: ${created.length} issued, £${created.reduce((s, i) => s + i.subtotal, 0).toFixed(0)} billed, £${created.reduce((s, i) => s + i.platformFee, 0).toFixed(0)} platform fee`);
   if (created.length > 0 && !world.features.settlement) {
@@ -1126,8 +1456,9 @@ export async function settlePayments(ctx: SimContext): Promise<void> {
     if (!host || host.status === 'LEFT' || host.payLagDays >= 90) continue; // the chronic late payer never pays
     if (p.kind === 'host') {
       // Decision 1: the host pays the platform; the platform's finance team records the receipt.
-      await api.task('Record a host payment', 'agency finance', () => api.post(`/api/v1/finance/host-invoices/${p.invoiceId}/mark-paid`, world.platformAdminToken, { reference: `BACS-${p.invoiceId.slice(-6)}` }));
+      const paid = await api.task('Record a host payment', 'agency finance', () => api.post(`/api/v1/finance/host-invoices/${p.invoiceId}/mark-paid`, world.platformAdminToken, { reference: `BACS-${p.invoiceId.slice(-6)}` }));
       api.countTask('Record a host payment');
+      if (paid.status === 200) runTotals.hostPaymentsRecorded++;
     } else {
       await api.task('Mark a statement paid', 'host finance', () => api.post(`/api/v1/invoices/${p.invoiceId}/mark-paid`, host.adminToken));
       api.countTask('Mark a statement paid');
@@ -1247,6 +1578,8 @@ export async function importWorkers(ctx: SimContext, org: SimOrg, count: number,
     }
   }
   world.features.invitations = accepted > 0;
+  runTotals.invited += apply.body?.invited ?? generated.filter((g) => g.invite).length;
+  runTotals.accepted += accepted;
   ctx.log(`${fmtDate(clock.now)} ${org.name}: imported ${org.workers.length} workers from a spreadsheet; ${generated.filter((g) => g.invite).length} invited by email, ${accepted} accepted`);
   return true;
 }

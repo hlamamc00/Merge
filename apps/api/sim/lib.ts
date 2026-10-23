@@ -96,7 +96,7 @@ export class ApiClient {
     }
   }
 
-  async call<T = any>(method: string, path: string, token: string | null, body?: unknown): Promise<{ status: number; body: T }> {
+  async call<T = any>(method: string, path: string, token: string | null, body?: unknown): Promise<{ status: number; body: T; contentType: string | null }> {
     const started = performance.now();
     const headers: Record<string, string> = { accept: 'application/json' };
     if (token) headers.authorization = `Bearer ${token}`;
@@ -107,11 +107,11 @@ export class ApiClient {
     try {
       parsed = text ? JSON.parse(text) : null;
     } catch {
-      parsed = text;
+      parsed = text; // CSV and other downloads come back as the raw text
     }
     const ms = performance.now() - started;
     this.calls.push({ task: this.currentTask, actor: this.currentActor, method, path: path.replace(/\/[a-z]+_[a-z0-9]{16}/g, '/:id'), status: res.status, ms, error: res.status >= 400 ? parsed?.error : undefined });
-    return { status: res.status, body: parsed };
+    return { status: res.status, body: parsed, contentType: res.headers.get('content-type') };
   }
 
   get<T = any>(path: string, token: string | null) {
@@ -180,19 +180,36 @@ export interface Gap {
   /** A product decision the platform owner must make before this can be built. */
   decisionNeeded?: string;
   occurrences: number;
-  /** 'fixed' when the defect was corrected during the exercise (the re-run shows it gone). */
+  /** 'fixed' when the probe verified the feature working (or the defect was corrected during the exercise). */
   status?: 'open' | 'fixed';
 }
 
 export class GapRegister {
   readonly gaps = new Map<string, Gap>();
+  /**
+   * The first record wins, except that a verified fix re-recorded as fixed refreshes its evidence: the
+   * later verification carries the fuller numbers. A failure seen once keeps the gap open.
+   */
   record(g: Omit<Gap, 'occurrences'>): void {
     const existing = this.gaps.get(g.id);
     if (existing) {
       existing.occurrences++;
+      if (existing.status === 'fixed' && g.status === 'fixed') {
+        existing.evidence = g.evidence;
+        existing.title = g.title;
+      } else if (existing.status === 'fixed') {
+        // A failure after a pass is still a failure: the open record replaces the verified one.
+        Object.assign(existing, g, { status: 'open', occurrences: existing.occurrences });
+      }
       return;
     }
-    this.gaps.set(g.id, { ...g, occurrences: 1 });
+    const gap: Gap = { ...g, occurrences: 1 };
+    if (gap.status === 'fixed') delete gap.decisionNeeded; // nothing to decide about a feature that works
+    this.gaps.set(g.id, gap);
+  }
+  /** True once the gap has been recorded as fixed (and never as open). */
+  isFixed(id: string): boolean {
+    return this.gaps.get(id)?.status === 'fixed';
   }
   list(): Gap[] {
     const order: Record<GapSeverity, number> = { blocker: 0, high: 1, medium: 2, low: 3 };

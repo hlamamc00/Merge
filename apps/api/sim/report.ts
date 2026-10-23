@@ -31,6 +31,13 @@ function trim(raw: string, max = 900): string {
   return `${cut.slice(0, end > 300 ? end + 1 : max)} …`;
 }
 
+/** An update appended after the walkthrough (persona-extensions.json) must survive the cut, so it follows the trimmed text. */
+function evidenceLine(raw: string, max = 900): string {
+  const i = raw.indexOf(' Since the walkthrough:');
+  if (i < 0) return trim(raw, max);
+  return `${trim(raw.slice(0, i), max)} ${flat(raw.slice(i))}`;
+}
+
 const sum = (xs: number[]) => xs.reduce((s, n) => s + n, 0);
 const pct = (n: number, d: number) => (d ? `${Math.round((n / d) * 100)}%` : '–');
 const median = (xs: number[]) => {
@@ -103,8 +110,11 @@ export function renderReport(r: Result): string {
     .join('\n');
 
   const sevIcon: Record<string, string> = { blocker: '🟥 Blocker', high: '🟧 High', medium: '🟨 Medium', low: '⬜ Low' };
+  // Gaps the probes found working are reported on their own; the register below holds only what is still open.
+  const openGaps = r.gaps.filter((g) => g.status !== 'fixed');
+  const fixedGaps = r.gaps.filter((g) => g.status === 'fixed');
   const byCategory = new Map<string, Gap[]>();
-  for (const g of r.gaps) byCategory.set(g.category, [...(byCategory.get(g.category) ?? []), g]);
+  for (const g of openGaps) byCategory.set(g.category, [...(byCategory.get(g.category) ?? []), g]);
   const gapSections = [...byCategory.entries()]
     .map(
       ([cat, gaps]) =>
@@ -113,8 +123,8 @@ export function renderReport(r: Result): string {
           .map(
             (g) =>
               `#### ${g.id} · ${g.title}\n\n` +
-              `**Severity:** ${sevIcon[g.severity]} · **Seen by:** ${g.persona} · **First hit:** month ${g.month + 1}${g.occurrences > 1 ? ` · **Recurred:** ${g.occurrences}×` : ''}${g.status === 'fixed' ? ' · **Status:** ✅ fixed during the exercise' : ''}\n\n` +
-              `- **What happened:** ${trim(g.evidence)}\n` +
+              `**Severity:** ${sevIcon[g.severity]} · **Seen by:** ${g.persona} · **First hit:** month ${g.month + 1}${g.occurrences > 1 ? ` · **Recurred:** ${g.occurrences}×` : ''}\n\n` +
+              `- **What happened:** ${evidenceLine(g.evidence)}\n` +
               `- **Why it matters:** ${flat(g.impact)}\n` +
               `- **Proposed solution:** ${flat(g.proposal)}\n` +
               (g.decisionNeeded ? `- **Decision needed:** ${flat(g.decisionNeeded)}\n` : ''),
@@ -123,9 +133,14 @@ export function renderReport(r: Result): string {
     )
     .join('\n');
 
-  const decisions = r.gaps.filter((g) => g.decisionNeeded).map((g, i) => `${i + 1}. **${g.id}** – ${flat(g.decisionNeeded!)}`).join('\n');
+  const fixedByCategory = new Map<string, Gap[]>();
+  for (const g of fixedGaps) fixedByCategory.set(g.category, [...(fixedByCategory.get(g.category) ?? []), g]);
+  // A persona finding corrected in the codebase carries the verifier's original evidence; the line says what now exists instead.
+  const fixedSections = [...fixedByCategory.entries()].map(([cat, gaps]) => `### ${cat}\n\n` + gaps.map((g) => `- **${g.id}** · ${g.title} — ${trim(r.fixed?.[g.id] ?? g.evidence, 700)}`).join('\n')).join('\n\n');
+
+  const decisions = openGaps.filter((g) => g.decisionNeeded).map((g, i) => `${i + 1}. **${g.id}** – ${flat(g.decisionNeeded!)}`).join('\n');
   const counts = { blocker: 0, high: 0, medium: 0, low: 0 } as Record<string, number>;
-  for (const g of r.gaps) counts[g.severity]!++;
+  for (const g of openGaps) counts[g.severity]!++;
 
   const providerRows = r.providers.map((p) => `| ${p.name} | ${p.size} | ${p.staff} | ${p.sites} | ${p.joinWeek + 1} | ${p.status} |`).join('\n');
 
@@ -208,11 +223,17 @@ ${notifRows}
 | --- | --- |
 ${errorRows || '| none | 0 |'}
 
+## Verified fixed in this run
+
+${fixedGaps.length} gap(s) from the previous register are closed: the scripted ones were attempted again by the same simulated people and found working (each line is the evidence the probe recorded), and the persona findings were answered in the codebase (each line says what now exists). They are left out of the open register and its counts.
+
+${fixedSections || 'None.'}
+
 ## Gap register
 
-${counts.blocker} blockers, ${counts.high} high, ${counts.medium} medium, ${counts.low} low. Ids starting with a scripted prefix (ONB, DSP, CMP, FIN, …) come from the scripted six-month run; ids starting with P (PH, PR, PW, PA, PF, PC, PM, PS, PT) come from persona walkthroughs of the end state by an HR manager, a small-home rota manager, a care worker on a phone, the agency owner, a host finance clerk, a compliance officer, a registered manager facing inspection, a supplier rota manager and an IT/data-protection lead, each finding checked by an independent verifier against the running system. Each gap records what the simulated person tried, what the platform did, and a proposed solution. Where the solution needs a product decision, it is listed under **Decisions needed** at the end.
+**Still open: ${openGaps.length}** (${counts.blocker} blockers, ${counts.high} high, ${counts.medium} medium, ${counts.low} low). Ids starting with a scripted prefix (ONB, DSP, CMP, FIN, …) come from the scripted six-month run; ids starting with P (PH, PR, PW, PA, PF, PC, PM, PS, PT) come from persona walkthroughs of the end state by an HR manager, a small-home rota manager, a care worker on a phone, the agency owner, a host finance clerk, a compliance officer, a registered manager facing inspection, a supplier rota manager and an IT/data-protection lead, each finding checked by an independent verifier against the running system. Each gap records what the simulated person tried, what the platform did, and a proposed solution. Where the solution needs a product decision, it is listed under **Decisions needed** at the end.
 
-${gapSections}
+${gapSections || 'None.'}
 
 ## Fixed during the exercise
 

@@ -36,11 +36,14 @@ import {
   onboardProvider,
   planWeek,
   postDueShifts,
+  recordWorkerExpiryGap,
   resolveDisputes,
   refreshFloorRate,
+  runTotals,
   settlePayments,
   supplierCheck,
   workerCheck,
+  type OutboundMail,
   type ProviderSpec,
   type SimContext,
 } from './scenario.js';
@@ -116,7 +119,15 @@ async function main() {
       return null; // table absent on an older API
     }
   };
-  const ctx: SimContext = { api, clock, rng, gaps, log, world, stats, mailbox };
+  const countEmails = (predicate: (m: OutboundMail) => boolean): number => {
+    try {
+      const rows = sqlite.prepare(`select to_address "to", subject, body, created_at createdAt from outbound_messages where channel = 'EMAIL'`).all() as OutboundMail[];
+      return rows.filter(predicate).length;
+    } catch {
+      return 0; // table absent on an older API
+    }
+  };
+  const ctx: SimContext = { api, clock, rng, gaps, log, world, stats, mailbox, countEmails };
   const tick = () => api.post('/api/v1/admin/scheduler/tick', world.platformAdminToken);
 
   log(`Merge market-entry simulation: ${WEEKS} weeks from ${fmtDate(SIM_START)}, seed ${SEED}`);
@@ -150,7 +161,14 @@ async function main() {
         clock.set(new Date(weekStart.getTime() + day * DAY + step * STEP_HOURS * HOUR));
         const hour = clock.now.getUTCHours();
         const t = await tick();
-        if (t.status === 200) stats.current.shiftsExpiredUnfilled += t.body.shifts?.expired ?? 0;
+        if (t.status === 200) {
+          stats.current.shiftsExpiredUnfilled += t.body.shifts?.expired ?? 0;
+          // What the daily jobs did, for the finance evidence (FIN-01, FIN-02).
+          runTotals.markedOverdue += t.body.finance?.markedOverdue ?? 0;
+          runTotals.financeReminders += t.body.finance?.reminders ?? 0;
+          runTotals.creditHoldsApplied += t.body.finance?.holdsApplied ?? 0;
+          runTotals.autoApproved += t.body.autoApproved ?? 0;
+        }
         for (const org of rng.shuffle(world.activeOrgs())) {
           await postDueShifts(ctx, org);
           if (org.checkHours.includes(hour)) {
@@ -196,9 +214,8 @@ async function main() {
   await ev.probeReporting(ctx, host);
   await ev.probePagination(ctx);
   await ev.probeDaylightSaving(ctx);
-  await ev.probeNotificationVolume(ctx, notificationsPerOrgDay, notificationsByType);
-  deriveGapsFromData(ctx, sqlite);
-  deriveGapsFromWeeks(gaps, stats.weeks);
+  await ev.probeNotificationVolume(ctx, notificationsPerOrgDay, notificationsByType, stats.weeks.reduce((s, w) => s + (w.emailsSent ?? 0), 0));
+  recordWorkerExpiryGap(ctx, true);
   // How auto-escalated shifts ended: started with someone confirmed, or still unfilled.
   let escalation: { shifts: number; filled: number; expired: number } | null = null;
   try {
@@ -207,6 +224,8 @@ async function main() {
   } catch {
     /* columns absent on an older API */
   }
+  deriveGapsFromData(ctx, sqlite, escalation);
+  deriveGapsFromWeeks(gaps, stats.weeks, { workerRequests: api.taskOccurrences.get('Worker requests a shift') ?? 0 });
 
   const elapsedMin = Math.round(((performance.now() - startedAt) / 60_000) * 10) / 10;
   const result = {
@@ -284,36 +303,61 @@ async function runEvents(ctx: SimContext, week: number) {
   }
 }
 
+/** Monday of the ISO week holding the instant, as a date key (weeks are compared in UTC; a London Monday 00:00 lands on the same date). */
+function mondayKey(ms: number): string {
+  const d = new Date(ms);
+  d.setUTCHours(0, 0, 0, 0);
+  d.setUTCDate(d.getUTCDate() - ((d.getUTCDay() + 6) % 7));
+  return d.toISOString().slice(0, 10);
+}
+
 /** Findings that only show up in the data after months of activity. */
-function deriveGapsFromData(ctx: SimContext, sqlite: import('better-sqlite3').Database) {
+function deriveGapsFromData(ctx: SimContext, sqlite: import('better-sqlite3').Database, escalation: { shifts: number; filled: number; expired: number } | null) {
   const { gaps, stats, world } = ctx;
-  // 1. Weekly platform hours on top of contracted hours (the platform does not know the internal rota).
-  const over = sqlite
-    .prepare(
-      `with weekly as (
-         select a.worker_id, strftime('%Y-%W', s.starts_at/1000, 'unixepoch') wk,
-                sum((s.ends_at - s.starts_at)/3600000.0 - s.break_minutes/60.0) hrs
-         from shift_assignments a join shifts s on s.id = a.shift_id
-         where a.status in ('CONFIRMED','COMPLETED') group by 1,2)
-       select w.first_name || ' ' || w.last_name name, w.contracted_hours_per_week contracted, max(weekly.hrs) platform_hrs
-       from weekly join workers w on w.id = weekly.worker_id
-       where w.contracted_hours_per_week + weekly.hrs > 48
-       group by w.id order by platform_hrs desc limit 5`,
-    )
-    .all() as Array<{ name: string; contracted: number; platform_hrs: number }>;
-  const overCount = (sqlite.prepare(`with weekly as (select a.worker_id, strftime('%Y-%W', s.starts_at/1000, 'unixepoch') wk, sum((s.ends_at - s.starts_at)/3600000.0 - s.break_minutes/60.0) hrs from shift_assignments a join shifts s on s.id = a.shift_id where a.status in ('CONFIRMED','COMPLETED') group by 1,2) select count(*) c from weekly join workers w on w.id = weekly.worker_id where w.contracted_hours_per_week + weekly.hrs > 48`).get() as { c: number }).c;
-  if (overCount > 0) {
+  // 1. Weekly hours with the employer (contracted, or the week's recorded figure) plus platform bookings, per worker-week.
+  //    A worker who has signed the 48-hour opt-out may lawfully exceed it, so those weeks are counted separately.
+  const bookings = sqlite.prepare(`select a.worker_id workerId, s.starts_at startsAt, (s.ends_at - s.starts_at)/3600000.0 - s.break_minutes/60.0 hrs from shift_assignments a join shifts s on s.id = a.shift_id where a.status in ('CONFIRMED','COMPLETED')`).all() as Array<{ workerId: string; startsAt: number; hrs: number }>;
+  const people = new Map((sqlite.prepare(`select id, first_name || ' ' || last_name name, contracted_hours_per_week contracted, opted_out_of_48h optedOut from workers`).all() as Array<{ id: string; name: string; contracted: number; optedOut: number }>).map((p) => [p.id, p]));
+  const overrides = new Map<string, number>();
+  try {
+    for (const r of sqlite.prepare(`select worker_id workerId, week_start weekStart, internal_hours internalHours from worker_week_hours`).all() as Array<{ workerId: string; weekStart: number; internalHours: number }>) overrides.set(`${r.workerId}|${mondayKey(r.weekStart + 12 * HOUR)}`, r.internalHours);
+  } catch {
+    /* table absent on an older API */
+  }
+  const weekly = new Map<string, number>();
+  for (const b of bookings) {
+    const key = `${b.workerId}|${mondayKey(b.startsAt)}`;
+    weekly.set(key, (weekly.get(key) ?? 0) + b.hrs);
+  }
+  const over: Array<{ name: string; internal: number; platform: number }> = [];
+  let optedOutWeeks = 0;
+  for (const [key, platform] of weekly) {
+    const [workerId] = key.split('|');
+    const p = people.get(workerId!);
+    if (!p) continue;
+    const internal = overrides.get(key) ?? p.contracted;
+    if (internal + platform <= 48) continue;
+    if (p.optedOut) optedOutWeeks++;
+    else over.push({ name: p.name, internal, platform });
+  }
+  over.sort((a, b) => b.platform - a.platform);
+  const wf03 = { id: 'WF-03', category: 'Workforce' as const, severity: 'blocker' as const, persona: 'worker / employer (Working Time Regulations)', month: 5 };
+  if (over.length > 0) {
     gaps.record({
-      id: 'WF-03',
-      title: 'The 48-hour check ignores the worker\'s own rota: the platform only counts platform shifts',
-      category: 'Workforce',
-      severity: 'blocker',
-      persona: 'worker / employer (Working Time Regulations)',
-      month: 5,
-      evidence: `${overCount} worker-weeks exceeded 48 hours once contracted hours are added to platform bookings, e.g. ${over.map((o) => `${o.name}: ${o.contracted}h contracted + ${o.platform_hrs.toFixed(1)}h on the platform`).join('; ')}. The eligibility rule has a field for internal hours but nothing feeds it.`,
+      ...wf03,
+      title: 'The 48-hour limit can still be exceeded',
+      evidence: `${over.length} worker-week(s) exceeded 48 hours once the employer's hours (contracted, or the figure recorded for that week) are added to platform bookings, for workers who have not signed an opt-out, e.g. ${over.slice(0, 5).map((o) => `${o.name}: ${o.internal}h with the employer + ${o.platform.toFixed(1)}h on the platform`).join('; ')}. ${optedOutWeeks} further worker-week(s) over 48 belonged to workers with a signed opt-out, which is lawful.`,
       impact: 'Fatigued workers, a regulatory breach for the employer, and an avoidable safeguarding risk at the host.',
-      proposal: 'Count contracted hours by default (configurable per worker), let employers declare the worker\'s actual rota hours for the week (or import the rota), and show the running total before a request.',
-      decisionNeeded: 'Should the platform assume a worker is working their full contracted hours for their employer every week unless told otherwise?',
+      proposal: 'Check why the cap was passed (a booking made before the week\'s hours were recorded, or an override lowered after the booking); show the running total before a request and re-check bookings when the employer\'s figure changes.',
+    });
+  } else {
+    gaps.record({
+      ...wf03,
+      title: 'The 48-hour check counts the worker\'s hours with their employer',
+      status: 'fixed',
+      evidence: `No worker-week exceeded 48 hours once the employer's hours were added to platform bookings, apart from ${optedOutWeeks} week(s) belonging to workers who have signed the opt-out, which is lawful. Contracted hours count by default (decision 8), the employer records the actual hours for any ISO week (PUT /workers/:id/weeks/:monday, in bulk, or by naming the staff a surplus flag frees), and both the request and the confirmation re-check the cap.`,
+      impact: 'The platform no longer books a worker into a breach of the Working Time Regulations on the employer\'s behalf.',
+      proposal: 'Keep: contracted hours by default with weekly overrides; a rota import would remove the manual step.',
     });
   }
   // 1b. Eligibility look-ups evaluate every worker of the supplier on every call.
@@ -356,18 +400,30 @@ function deriveGapsFromData(ctx: SimContext, sqlite: import('better-sqlite3').Da
   const noShows = stats.weeks.reduce((s, w) => s + w.noShows, 0);
   const existing = gaps.gaps.get('TRS-01');
   if (existing) existing.evidence += ` Over the run: ${late} late cancellations and ${noShows} no-shows network-wide.`;
-  // 4. Unfilled shifts with nothing escalating them (decision 6 added escalation; once it has run, this finding no longer applies).
+  // 4. Unfilled shifts: did anything escalate them (decision 6), and how did the escalated ones end?
   const expired = stats.weeks.reduce((s, w) => s + w.shiftsExpiredUnfilled, 0);
   const posted = stats.weeks.reduce((s, w) => s + w.shiftsPosted, 0);
-  const escalated = stats.weeks.reduce((s, w) => s + (w.escalatedShifts ?? 0), 0);
-  if (expired > 0 && escalated === 0) {
+  let escalatedAll = 0;
+  try {
+    escalatedAll = (sqlite.prepare(`select count(*) c from shifts where escalation_step > 0`).get() as { c: number }).c;
+  } catch {
+    /* column absent on an older API */
+  }
+  const dsp01 = { id: 'DSP-01', category: 'Shifts & dispatch' as const, severity: 'high' as const, persona: 'rota manager at a host', month: 2 };
+  if (escalatedAll > 0) {
+    const auto = escalation ?? { shifts: 0, filled: 0, expired: 0 };
     gaps.record({
-      id: 'DSP-01',
+      ...dsp01,
+      title: 'Unfilled shifts escalate automatically within the host\'s ceiling, or by hand',
+      status: 'fixed',
+      evidence: `${escalatedAll} shifts were escalated as they neared their start (rate raised in steps within the host's ceiling, reach widened; hosts choose automatic or manual, decision 6). Of the ${auto.shifts} automatically escalated shifts that had started by the end of the run, ${auto.filled} started with someone confirmed and ${auto.expired} still went unfilled. Overall ${expired} of ${posted} shifts (${posted ? Math.round((expired / posted) * 100) : 0}%) started with nobody confirmed: escalation moves the odds, it does not create staff. Manual hosts get a prompt and POST /shifts/:id/escalate.`,
+      impact: 'A host no longer has to notice and edit the shift by hand to change its terms or reach.',
+      proposal: 'Keep: escalation steps and ceilings; an SMS blast to eligible workers waits on the provider decision (decision 15).',
+    });
+  } else if (expired > 0) {
+    gaps.record({
+      ...dsp01,
       title: 'Nothing escalates an unfilled shift: no auto-widening, rate uplift or agency fallback',
-      category: 'Shifts & dispatch',
-      severity: 'high',
-      persona: 'rota manager at a host',
-      month: 2,
       evidence: `${expired} of ${posted} shifts (${Math.round((expired / posted) * 100)}%) started with nobody confirmed. The only intervention available was an in-app warning 24 hours before; the rate, visibility and window never changed unless a manager edited the shift by hand.`,
       impact: 'Hosts fall back to phoning agencies, which is exactly what the platform set out to replace.',
       proposal: 'Escalation playbooks per host: at T-48h/T-24h/T-6h widen visibility, raise the rate by a step, release to the agency bank, and send an SMS blast to eligible workers; show the host what will happen and when.',

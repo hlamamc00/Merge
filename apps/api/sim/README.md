@@ -34,3 +34,4 @@ Outputs:
 - `scenario.ts` holds the world model and weekly behaviours; `events.ts` the scripted probes; `run.ts` the provider roster and the main loop; `report.ts` the Markdown renderer.
 - To test a product change, make it, re-run with the same seed, and diff `docs/SIMULATION-REPORT.md`: calls per task, fill rate, time to fill and the gap register will move.
 - Add a probe by writing a function that attempts the task through the API and calls `gaps.record(...)` with what happened. Use a stable `id` so repeat runs can be compared.
+- When a probe finds the feature working, record the same `id` with `status: 'fixed'` and evidence that carries the numbers; the report lists those under "Verified fixed in this run" and leaves them out of the open register. A fixed gap re-recorded later refreshes its evidence (the end-of-run figures win); a failure seen once keeps the gap open.
