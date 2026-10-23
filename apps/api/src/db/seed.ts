@@ -30,13 +30,15 @@ async function main() {
     sqlite.close();
     return;
   }
+  // Demo logins skip authenticator enrolment (decision 16 keeps it on in production).
+  db.update(platformSettings).set({ twoFactorRequiredForManagers: false, updatedAt: now }).where(eq(platformSettings.id, 'default')).run();
   const notifier = new Notifier(db, [], () => now);
   const passwordHash = await hashPassword(DEMO_PASSWORD);
 
   // ---------- Organisations ----------
   const agency = org(db, now, { name: 'Merge Staffing', type: OrgType.AGENCY, city: 'Manchester', postcode: 'M1 4BT', lat: 53.4794, lng: -2.2453, defaultChargeRate: 19, email: 'hello@merge.local' });
   db.update(platformSettings).set({ ownerOrgId: agency.id, updatedAt: now }).where(eq(platformSettings.id, 'default')).run();
-  const oakwood = org(db, now, { name: 'Oakwood Care Homes', type: OrgType.PROVIDER, city: 'Didsbury', postcode: 'M20 2RN', lat: 53.4186, lng: -2.2311, serviceTypes: ['RESIDENTIAL', 'NURSING'], defaultChargeRate: 18, email: 'rota@oakwood.local' });
+  const oakwood = org(db, now, { name: 'Oakwood Care Homes', type: OrgType.PROVIDER, city: 'Didsbury', postcode: 'M20 2RN', lat: 53.4186, lng: -2.2311, serviceTypes: ['RESIDENTIAL', 'NURSING'], defaultChargeRate: 18, email: 'rota@oakwood.local', escalationMode: 'AUTO', escalationCeilingPct: 20 });
   const riverside = org(db, now, { name: 'Riverside Living', type: OrgType.PROVIDER, city: 'Stockport', postcode: 'SK4 1AB', lat: 53.4106, lng: -2.1575, serviceTypes: ['RESIDENTIAL'], defaultChargeRate: 17.5, email: 'office@riverside.local', workerSelfServiceAllowed: true });
   const bright = org(db, now, { name: 'Bright Horizons Support', type: OrgType.PROVIDER, city: 'Sale', postcode: 'M33 7XY', lat: 53.4245, lng: -2.3223, serviceTypes: ['SUPPORTED_LIVING', 'LEARNING_DISABILITY'], defaultChargeRate: 16.5, email: 'team@brighthorizons.local' });
   const pennine = org(db, now, { name: 'Pennine Nursing', type: OrgType.PROVIDER, city: 'Oldham', postcode: 'OL1 3DF', lat: 53.5409, lng: -2.1114, serviceTypes: ['NURSING'], defaultChargeRate: 22, email: 'nursing@pennine.local' });
@@ -159,7 +161,7 @@ async function main() {
 
 function org(db: Db, now: Date, data: Partial<typeof organisations.$inferInsert> & { name: string; type: OrgType }) {
   const id = newId('org');
-  db.insert(organisations).values({ id, status: 'ACTIVE', serviceTypes: [], createdAt: now, updatedAt: now, ...data }).run();
+  db.insert(organisations).values({ id, status: 'ACTIVE', serviceTypes: [], mouAcceptedAt: now, mouVersion: '1.0', cqcRegistrationNumber: `1-${Math.floor(100000000 + Math.random() * 900000000)}`, createdAt: now, updatedAt: now, ...data }).run();
   return db.select().from(organisations).where(eq(organisations.id, id)).get()!;
 }
 

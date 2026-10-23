@@ -67,6 +67,8 @@ Demo logins (password `password123`):
 | `admin@pennine.local` | Pennine Nursing – nurse shortage |
 | `aisha@riverside.local` | A care worker whose employer allows self-service shift pick-up |
 
+Demo logins have authenticator two-factor switched off by the seed; production keeps it compulsory for admins and managers (see `docs/DECISIONS.md`, decision 16).
+
 Useful commands:
 
 ```bash
