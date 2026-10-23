@@ -2,17 +2,18 @@ import { Router, type NextFunction, type Request, type Response } from 'express'
 import { and, avg, desc, eq, gte, inArray } from 'drizzle-orm';
 import multer from 'multer';
 import { z } from 'zod';
-import { DocumentType, JobRole, Skill, UserRole, WorkerStatus, complianceSummary } from '@merge/shared';
-import { ratings, shiftAssignments, shifts, sites, users, workerDocuments, workerUnavailability, workers } from '../db/schema.js';
+import { DocumentType, JobRole, Skill, UserRole, WorkerStatus, addDays, complianceSummary, startOfIsoWeek, timeZoneOffsetMs } from '@merge/shared';
+import { ratings, shiftAssignments, shifts, sites, users, workerDocuments, workerUnavailability, workers, type WorkerWeekHours } from '../db/schema.js';
 import { auditFromReq } from '../lib/audit.js';
 import { MANAGERS, allowedSiteIds, assertOrgAccess, hashPassword, isManager, isPlatformAdmin, isSiteScoped, requireAuth, requireRole } from '../lib/auth.js';
 import { auth, deps } from '../lib/context.js';
-import { HttpError, badRequest, conflict, forbidden, h, notFound } from '../lib/errors.js';
+import { HttpError, badRequest, conflict, forbidden, h, notFound, unprocessable } from '../lib/errors.js';
 import { newId } from '../lib/ids.js';
 import { getStorage, newFileKey } from '../lib/storage.js';
 import { assertChanges, parseBody, parseQuery, zDate, zOptionalDate, zPostcode } from '../lib/validate.js';
 import { cancelFutureBookingsForWorker } from '../services/assignments.js';
 import { ALLOWED_DOCUMENT_MIME_TYPES, MAX_DOCUMENT_BYTES, activeDocuments, hostRequirementsForWorker, publicDocument } from '../services/compliance.js';
+import { clearInternalHours, listWeekHours, setInternalHours, weekStartsBetween } from '../services/weekHours.js';
 
 export const workersRouter = Router();
 workersRouter.use(requireAuth);
@@ -125,6 +126,58 @@ workersRouter.post(
   }),
 );
 
+// ---------- Hours with the employer (decision 8) ----------
+
+const zInternalHours = z.number().min(0).max(168);
+
+/** `YYYY-MM-DD` as a Europe/London date, which must be the Monday a week starts on; returns that midnight as an instant. */
+function parseWeekStart(ymd: string): Date {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(ymd);
+  if (!m) throw unprocessable('weekStart must be a date in the form YYYY-MM-DD');
+  const [y, mo, d] = [Number(m[1]), Number(m[2]), Number(m[3])];
+  const guess = new Date(Date.UTC(y, mo - 1, d));
+  if (guess.getUTCFullYear() !== y || guess.getUTCMonth() !== mo - 1 || guess.getUTCDate() !== d) throw unprocessable('weekStart is not a valid date');
+  // London clocks change at 01:00 UTC, never around midnight, so the offset at the UTC guess is the offset at local midnight.
+  const instant = new Date(guess.getTime() - timeZoneOffsetMs(guess));
+  if (startOfIsoWeek(instant).getTime() !== instant.getTime()) throw unprocessable('weekStart must be a Monday (Europe/London)');
+  return instant;
+}
+
+type WeekHoursSource = 'RECORDED' | 'FLAG' | 'CONTRACT';
+
+/** One week as the UI sees it: the figure eligibility will use and where it came from. */
+function weekRow(worker: { contractedHoursPerWeek: number | null }, weekStart: Date, row: Pick<WorkerWeekHours, 'internalHours' | 'note' | 'sourceFlagId'> | undefined) {
+  const source: WeekHoursSource = row ? (row.sourceFlagId ? 'FLAG' : 'RECORDED') : 'CONTRACT';
+  return {
+    weekStart: weekStart.toISOString(),
+    internalHours: row ? row.internalHours : worker.contractedHoursPerWeek ?? 0,
+    contractedHoursPerWeek: worker.contractedHoursPerWeek,
+    source,
+    note: row?.note ?? null,
+    sourceFlagId: row?.sourceFlagId ?? null,
+  };
+}
+
+/** Record one week's hours for many workers at once (rota import, end-of-week tidy-up). Declared before the `/:id` routes. */
+workersRouter.post(
+  '/week-hours',
+  requireRole(...MANAGERS),
+  h((req, res) => {
+    const { db, now } = deps(req);
+    const body = parseBody(req, z.object({ weekStart: z.string(), entries: z.array(z.object({ workerId: z.string(), internalHours: zInternalHours })).min(1).max(500) }));
+    const weekStart = parseWeekStart(body.weekStart);
+    // Check every worker before writing anything so a bad id does not leave a half-applied batch.
+    const entries = new Map(body.entries.map((e) => [e.workerId, e.internalHours]));
+    const targets = [...entries].map(([workerId, internalHours]) => ({ worker: loadWorker(req, workerId).worker, internalHours }));
+    const at = now();
+    for (const { worker, internalHours } of targets) {
+      setInternalHours(db, { workerId: worker.id, weekStart, internalHours, userId: auth(req).user.id }, at);
+      auditFromReq(req, db, { action: 'UPDATE', entityType: 'worker', entityId: worker.id, data: { weekStart: body.weekStart, internalHours } }, at);
+    }
+    res.json({ updated: targets.length });
+  }),
+);
+
 function loadWorker(req: Request, id: string) {
   const { db } = deps(req);
   const w = db.select().from(workers).where(eq(workers.id, id)).get();
@@ -217,6 +270,52 @@ workersRouter.post(
     db.update(workers).set({ userId: id, email: worker.email ?? body.email, updatedAt: at }).where(eq(workers.id, worker.id)).run();
     auditFromReq(req, db, { action: 'CREATE', entityType: 'user', entityId: id, data: { workerId: worker.id } }, at);
     res.status(201).json({ userId: id, email: body.email });
+  }),
+);
+
+/** The weeks ahead with the hours eligibility will count for the employer, and where each figure comes from. */
+workersRouter.get(
+  '/:id/weeks',
+  requireRole(...MANAGERS),
+  h((req, res) => {
+    const { db, now } = deps(req);
+    const { worker } = loadWorker(req, req.params.id!);
+    const q = parseQuery(req, z.object({ from: zDate.optional(), to: zDate.optional() }));
+    const from = q.from ?? now();
+    const to = q.to ?? addDays(from, 8 * 7);
+    if (to.getTime() <= from.getTime()) throw badRequest('to must be after from');
+    if (to.getTime() - from.getTime() > 53 * 7 * 86_400_000) throw badRequest('At most a year of weeks at a time');
+    const rows = new Map(listWeekHours(db, worker.id, from, to).map((r) => [r.weekStart.getTime(), r]));
+    res.json(weekStartsBetween(from, to).map((weekStart) => weekRow(worker, weekStart, rows.get(weekStart.getTime()))));
+  }),
+);
+
+/** The employer says how many hours the worker really has with them that week (0 = free to be lent for the whole 48h). */
+workersRouter.put(
+  '/:id/weeks/:weekStart',
+  requireRole(...MANAGERS),
+  h((req, res) => {
+    const { db, now } = deps(req);
+    const { worker } = loadWorker(req, req.params.id!);
+    const weekStart = parseWeekStart(req.params.weekStart!);
+    const body = parseBody(req, z.object({ internalHours: zInternalHours, note: z.string().max(500).nullable().optional() }));
+    const at = now();
+    const row = setInternalHours(db, { workerId: worker.id, weekStart, internalHours: body.internalHours, note: body.note, userId: auth(req).user.id }, at);
+    auditFromReq(req, db, { action: 'UPDATE', entityType: 'worker', entityId: worker.id, data: { weekStart: req.params.weekStart, internalHours: body.internalHours } }, at);
+    res.json(weekRow(worker, weekStart, row));
+  }),
+);
+
+/** Back to the contracted-hours assumption for that week. */
+workersRouter.delete(
+  '/:id/weeks/:weekStart',
+  requireRole(...MANAGERS),
+  h((req, res) => {
+    const { db, now } = deps(req);
+    const { worker } = loadWorker(req, req.params.id!);
+    const weekStart = parseWeekStart(req.params.weekStart!);
+    if (clearInternalHours(db, worker.id, weekStart)) auditFromReq(req, db, { action: 'UPDATE', entityType: 'worker', entityId: worker.id, data: { weekStart: req.params.weekStart, internalHours: null } }, now());
+    res.status(204).end();
   }),
 );
 

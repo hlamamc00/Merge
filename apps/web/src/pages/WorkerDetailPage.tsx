@@ -4,7 +4,7 @@ import { Link, useParams } from 'react-router-dom';
 import { DOCUMENT_LABELS, DocumentType, JOB_ROLE_LABELS, JobRole, SKILL_LABELS, Skill, WorkerStatus, requiredDocumentsForRole } from '@merge/shared';
 import { ApiError, api } from '../api/client';
 import { useAction, useSites } from '../api/hooks';
-import type { DirectoryOrg, WorkerDetail } from '../api/types';
+import type { DirectoryOrg, WorkerDetail, WorkerWeek } from '../api/types';
 import type { DocumentWithFile, HostRequirement, WorkerHostRequirement } from '../api/types.compliance';
 import { useAuth } from '../auth/AuthContext';
 import { ComplianceBadge, StatusBadge } from '../components/badges';
@@ -102,6 +102,12 @@ export function WorkerDetailPage() {
       <Card title="Unavailability" description="Blocks the worker from being put forward during these periods." actions={<Button size="sm" variant="secondary" onClick={() => setAddUnav(true)}>＋ Add</Button>}>
         <UnavailabilityList worker={w} />
       </Card>
+
+      {canManage && (
+        <Card title="Hours with us" description="Other organisations can only book this worker within the 48-hour weekly limit. Unless you say otherwise, their contracted hours with you are assumed for every week; record the real figure for weeks they are not rostered.">
+          <WeekHoursList worker={w} />
+        </Card>
+      )}
 
       <EditWorkerModal open={edit} onClose={() => setEdit(false)} worker={w} />
       <AddDocumentModal open={addDoc} onClose={() => setAddDoc(false)} workerId={w.id} canVerify={canManage} />
@@ -234,6 +240,45 @@ function DeclareRequirementModal({ open, onClose, worker }: { open: boolean; onC
         </div>
       </div>
     </Modal>
+  );
+}
+
+const ymdLondon = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/London', year: 'numeric', month: '2-digit', day: '2-digit' });
+
+const WEEK_SOURCE_LABEL: Record<WorkerWeek['source'], string> = { CONTRACT: 'Contract', RECORDED: 'Recorded', FLAG: 'Surplus flag' };
+
+/** Decision 8: this week and the next three, with the hours eligibility will count for the employer. */
+function WeekHoursList({ worker }: { worker: Detail }) {
+  const weeks = useQuery({ queryKey: ['worker-weeks', worker.id], queryFn: () => api.get<WorkerWeek[]>(`/workers/${worker.id}/weeks`, { to: new Date(Date.now() + 28 * 86_400_000).toISOString() }) });
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const save = useAction((args: { weekStart: string; internalHours: number }) => api.put(`/workers/${worker.id}/weeks/${ymdLondon.format(new Date(args.weekStart))}`, { internalHours: args.internalHours }), () => setDrafts({}));
+  const reset = useAction((weekStart: string) => api.delete(`/workers/${worker.id}/weeks/${ymdLondon.format(new Date(weekStart))}`), () => setDrafts({}));
+  if (weeks.isLoading) return <Loading />;
+  const rows = (weeks.data ?? []).slice(0, 4);
+  return (
+    <>
+      <ErrorBanner error={save.error ?? reset.error ?? weeks.error} className="mb-3" />
+      <p className="mb-2 text-sm text-slate-700">Contracted: <span className="font-medium">{worker.contractedHoursPerWeek != null ? `${worker.contractedHoursPerWeek}h / week` : 'not set (counts as 0h)'}</span></p>
+      <ul className="divide-y divide-slate-100 text-sm">
+        {rows.map((wk, i) => {
+          const draft = drafts[wk.weekStart] ?? String(wk.internalHours);
+          const changed = draft !== '' && Number(draft) !== wk.internalHours;
+          return (
+            <li key={wk.weekStart} className="flex flex-wrap items-center justify-between gap-2 py-2">
+              <div>
+                <div className="font-medium text-slate-900">Week of {fmtDate(wk.weekStart)}{i === 0 && <span className="ml-1 text-xs font-normal text-slate-500">(this week)</span>}</div>
+                <div className="text-xs text-slate-500">{wk.internalHours}h with us · <Badge tone={wk.source === 'CONTRACT' ? 'slate' : wk.source === 'FLAG' ? 'brand' : 'green'}>{WEEK_SOURCE_LABEL[wk.source]}</Badge>{wk.note && <span> · {wk.note}</span>}</div>
+              </div>
+              <div className="flex items-center gap-1">
+                <Input type="number" min="0" max="168" step="0.5" value={draft} onChange={(e) => setDrafts({ ...drafts, [wk.weekStart]: e.target.value })} className="w-24" aria-label={`Hours with us, week of ${fmtDate(wk.weekStart)}`} />
+                <Button size="sm" onClick={() => save.mutate({ weekStart: wk.weekStart, internalHours: Number(draft) })} loading={save.isPending} disabled={!changed}>Save</Button>
+                {wk.source !== 'CONTRACT' && <Button size="sm" variant="ghost" onClick={() => reset.mutate(wk.weekStart)} loading={reset.isPending}>Reset</Button>}
+              </div>
+            </li>
+          );
+        })}
+      </ul>
+    </>
   );
 }
 

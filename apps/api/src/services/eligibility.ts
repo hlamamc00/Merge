@@ -1,5 +1,5 @@
 import { and, eq, gt, inArray, isNull, lt, ne } from 'drizzle-orm';
-import { evaluateEligibility, type EligibilityIssue, type EligibilityResult } from '@merge/shared';
+import { evaluateEligibility, startOfIsoWeek, type EligibilityIssue, type EligibilityResult } from '@merge/shared';
 import type { Db } from '../db/client.js';
 import {
   hostRequirements,
@@ -17,6 +17,7 @@ import {
 } from '../db/schema.js';
 import { accessFor, type AccessInfo } from './dispatch.js';
 import { workingTimeRulesFrom } from './settings.js';
+import { getInternalHours } from './weekHours.js';
 
 export const LIVE_ASSIGNMENT_STATUSES = ['REQUESTED', 'OFFERED', 'CONFIRMED'] as const;
 
@@ -118,8 +119,9 @@ export function evaluateWorkerForShift(
       skills: worker.skills,
       documents,
       maxHoursPerWeek: worker.maxHoursPerWeek,
-      // Decision 8: assume the worker works their full contracted hours for their employer unless told otherwise.
-      internalHoursThisWeek: worker.contractedHoursPerWeek ?? 0,
+      // Decision 8: assume the worker works their full contracted hours for their employer unless the
+      // employer has recorded the real figure for the shift's week (by hand or through a surplus flag).
+      internalHoursThisWeek: getInternalHours(db, worker.id, startOfIsoWeek(shift.startsAt)) ?? worker.contractedHoursPerWeek ?? 0,
       optedOutOf48h: worker.optedOutOf48h,
       lat: worker.lat,
       lng: worker.lng,

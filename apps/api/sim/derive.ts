@@ -36,8 +36,15 @@ export interface Observation {
   detail: string;
 }
 
+/** How auto-escalated shifts ended (from the database at the end of the run); absent on an older result. */
+export interface EscalationOutcome {
+  shifts: number;
+  filled: number;
+  expired: number;
+}
+
 /** Plain-language readings of the numbers, for the report. */
-export function observations(weeks: WeekStats[], providers: Array<{ name: string; status: string }>): Observation[] {
+export function observations(weeks: WeekStats[], providers: Array<{ name: string; status: string }>, escalation?: EscalationOutcome | null): Observation[] {
   const out: Observation[] = [];
   const posted = sum(weeks.map((w) => w.shiftsPosted));
   const expired = sum(weeks.map((w) => w.shiftsExpiredUnfilled));
@@ -45,9 +52,16 @@ export function observations(weeks: WeekStats[], providers: Array<{ name: string
   const pr = sum(weeks.map((w) => w.confirmedViaPriority));
   const ag = sum(weeks.map((w) => w.confirmedViaAgency));
   const urgent = sum(weeks.map((w) => w.urgentPosted));
+  const escalated = sum(weeks.map((w) => w.escalatedShifts ?? 0));
+  const intervention =
+    escalated === 0
+      ? "nothing on the platform changed a shift's terms or reach when it was still open close to its start"
+      : escalation && escalation.shifts > 0
+        ? `${escalated} shifts were escalated automatically as they neared their start (rate raised within the host's ceiling, reach widened); of the ${escalation.shifts} that had started by the end of the run, ${escalation.filled} (${Math.round((escalation.filled / escalation.shifts) * 100)}%) started with someone confirmed and ${escalation.expired} still went unfilled`
+        : `${escalated} shifts were escalated automatically as they neared their start (rate raised within the host's ceiling, reach widened); the month table shows the count beside the overall fill rate`;
   out.push({
     title: `${Math.round((expired / posted) * 100)}% of shifts started with nobody confirmed`,
-    detail: `${expired} of ${posted} shifts went unfilled. The network never had enough spare, compliant, in-range staff for winter demand, and nothing on the platform changed a shift's terms or reach when it was still open close to its start. ${Math.round((urgent / posted) * 100)}% of shifts were posted within 12 hours of starting, which collapses the priority windows and turns the exchange into a scramble.`,
+    detail: `${expired} of ${posted} shifts went unfilled. The network never had enough spare, compliant, in-range staff for winter demand, and ${intervention}. ${Math.round((urgent / posted) * 100)}% of shifts were posted within 12 hours of starting, which collapses the priority windows and turns the exchange into a scramble.`,
   });
   out.push({
     title: `The agency bank filled ${Math.round((ag / conf) * 100)}% of bookings; priority access filled ${Math.round((pr / conf) * 100)}%`,
@@ -70,8 +84,14 @@ export function observations(weeks: WeekStats[], providers: Array<{ name: string
   const left = providers.filter((p) => p.status !== 'ACTIVE').map((p) => p.name);
   if (left.length) out.push({ title: `${left.length} organisation(s) ended the run suspended or gone`, detail: `${left.join(', ')}. Their open shifts, bookings and statements were left for people to sort out by hand; see PLT-01 and PLT-02.` });
   const notif = sum(weeks.map((w) => w.notificationsSent));
+  const emails = sum(weeks.map((w) => w.emailsSent ?? 0));
   const peakWeek = weeks.reduce((a, b) => (b.notificationsSent > a.notificationsSent ? b : a));
-  out.push({ title: `${notif.toLocaleString()} notifications, none delivered outside the app`, detail: `Peak week ${peakWeek.weekStart}: ${peakWeek.notificationsSent.toLocaleString()} notifications across the network, mostly release notices. Every urgent shift, late cancellation and dispute relied on someone happening to log in.` });
+  const peak = `Peak week ${peakWeek.weekStart}: ${peakWeek.notificationsSent.toLocaleString()} notifications across the network, mostly release notices.`;
+  out.push(
+    emails > 0
+      ? { title: `${notif.toLocaleString()} notifications generated, ${emails.toLocaleString()} emails sent (immediate and daily digest)`, detail: `${peak} Urgent shifts, late cancellations and disputes went out by email at once; the rest were batched into each person's daily digest, so nobody had to be logged in to hear about them.` }
+      : { title: `${notif.toLocaleString()} notifications, none delivered outside the app`, detail: `${peak} Every urgent shift, late cancellation and dispute relied on someone happening to log in.` },
+  );
   return out;
 }
 

@@ -175,13 +175,16 @@ export function evaluateEligibility(
     }
   }
 
-  const weeklyBefore = weeklyBookedHours(shift, booked) + (worker.internalHoursThisWeek ?? 0);
+  const internalHours = worker.internalHoursThisWeek ?? 0;
+  const weeklyBefore = weeklyBookedHours(shift, booked) + internalHours;
   const weeklyAfter = weeklyBefore + shiftHours;
   const cap = Math.min(worker.maxHoursPerWeek ?? rules.maxWeeklyHours, rules.maxWeeklyHours);
   if (weeklyAfter > cap) {
-    const msg = `Would take the worker to ${weeklyAfter.toFixed(1)}h this week (limit ${cap}h)`;
+    // Spell out the employer's share: the usual fix is for the employer to record the real rostered hours (decision 8).
+    const split = internalHours > 0 ? `: ${hrs(internalHours)}h with their employer + ${hrs(weeklyAfter - internalHours)}h here` : '';
+    const msg = `Would take the worker to ${weeklyAfter.toFixed(1)}h this week (limit ${cap}h)${split}`;
     if (worker.optedOutOf48h && ctx.allowHoursOverride) warnings.push({ code: 'WEEKLY_HOURS_EXCEEDED', message: `${msg} – overridden (48h opt-out on file)` });
-    else blockers.push({ code: 'WEEKLY_HOURS_EXCEEDED', message: msg });
+    else blockers.push({ code: 'WEEKLY_HOURS_EXCEEDED', message: internalHours > 0 ? `${msg}. If they are not rostered that week, their employer can record their actual hours.` : msg });
   }
 
   if (shiftHours > rules.maxShiftHours) {
@@ -211,4 +214,9 @@ export function evaluateEligibility(
 
 function label(code: string): string {
   return code.toLowerCase().replace(/_/g, ' ');
+}
+
+/** 37.5 → "37.5", 12 → "12". */
+function hrs(n: number): string {
+  return String(Math.round(n * 100) / 100);
 }

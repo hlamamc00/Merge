@@ -8,6 +8,7 @@
  */
 import { requiredDocumentsForRole, type DocumentType, type JobRole, type Skill } from '@merge/shared';
 import { AREAS, ApiClient, Clock, DAY, GapRegister, HOUR, Rng, fmtDate, iso, personName, postcodeNear, round1 } from './lib.js';
+import { totpCode } from '../src/lib/totp.js';
 
 export type RoleGroup = 'CARE' | 'SENIOR' | 'NURSE';
 export type Size = 'large' | 'medium' | 'small';
@@ -62,6 +63,8 @@ export interface SimOrg {
   queue: PendingPost[];
   noShowsCaused: number;
   blockedBy: string[];
+  /** How the staff were loaded and what it cost; null for the agency (its bank is created at bootstrap). */
+  onboarding: { method: 'import' | 'one-by-one'; staff: number; apiCalls: number } | null;
 }
 
 export interface PendingPost {
@@ -125,6 +128,7 @@ export interface WeekStats {
   reportsRaised: number;
   barsCreated: number;
   emailsSent: number;
+  workersReleased: number;
 }
 
 export class Stats {
@@ -167,6 +171,7 @@ export class Stats {
       reportsRaised: 0,
       barsCreated: 0,
       emailsSent: 0,
+      workersReleased: 0,
     };
     this.weeks.push(this.current);
   }
@@ -278,10 +283,18 @@ export async function bootstrapAgency(ctx: SimContext, bankSize: number): Promis
     queue: [],
     noShowsCaused: 0,
     blockedBy: [],
+    onboarding: null,
   };
   world.agency = agency;
   world.orgs.push(agency);
-  await api.task('Platform settings', 'agency owner', () => api.patch('/api/v1/admin/settings', world.platformAdminToken, { platformFeePct: 8, priorityWindowMinutes: 120, agencyWindowMinutes: 60, agencyPosition: 'AFTER_PRIORITY', twoFactorRequiredForManagers: false }));
+  // Decision 16: managers must enrol an authenticator before anything else. The platform owner does so here;
+  // the trial then switches the requirement off for the other organisations so their sign-up effort is measured without it.
+  const setup = await api.task('Authenticator enrolment', 'agency owner', () => api.post('/api/v1/auth/2fa/setup', world.platformAdminToken, {}));
+  if (setup.status !== 200) throw new Error(`2fa setup failed: ${JSON.stringify(setup.body)}`);
+  const enabled = await api.task('Authenticator enrolment', 'agency owner', () => api.post('/api/v1/auth/2fa/enable', world.platformAdminToken, { code: totpCode(setup.body.secret, clock.now) }));
+  if (enabled.status !== 200) throw new Error(`2fa enable failed: ${JSON.stringify(enabled.body)}`);
+  const settings = await api.task('Platform settings', 'agency owner', () => api.patch('/api/v1/admin/settings', world.platformAdminToken, { platformFeePct: 8, priorityWindowMinutes: 120, agencyWindowMinutes: 60, agencyPosition: 'AFTER_PRIORITY', twoFactorRequiredForManagers: false }));
+  if (settings.status !== 200) throw new Error(`platform settings failed: ${JSON.stringify(settings.body)}`);
   await refreshFloorRate(ctx);
   await addWorkers(ctx, agency, bankSize, { loginShare: 0.8 });
   ctx.log(`${fmtDate(clock.now)} agency ready with a bank of ${bankSize}`);
@@ -334,6 +347,7 @@ export async function onboardProvider(ctx: SimContext, spec: ProviderSpec): Prom
     queue: [],
     noShowsCaused: 0,
     blockedBy: [],
+    onboarding: null,
   };
   world.orgs.push(org);
 
@@ -366,6 +380,7 @@ export async function onboardProvider(ctx: SimContext, spec: ProviderSpec): Prom
 
   const elapsedMin = round1((performance.now() - started) / 60_000);
   const calls = api.calls.length - callsBefore;
+  org.onboarding = { method: imported ? 'import' : 'one-by-one', staff: spec.staff, apiCalls: calls };
   ctx.log(`${fmtDate(clock.now)} onboarded ${spec.name} (${spec.staff} staff, ${spec.sites} site(s)) ${imported ? 'by spreadsheet import' : 'one worker at a time'}: ${calls} API calls, ${elapsedMin} min of machine time`);
   if (spec.staff >= 40 && !imported) {
     gaps.record({
@@ -685,6 +700,11 @@ export async function workerCheck(ctx: SimContext, org: SimOrg): Promise<void> {
     const open = (board.body as any[]).filter((s) => s.access.open && s.myAssignments.length === 0 && s.placesLeft > 0);
     if (open.length === 0 || !rng.chance(0.5)) continue;
     const shift = rng.pick(open);
+    // The board marks each row "you can take this" or "not eligible"; nobody presses Request on the latter.
+    if (shift.eligible === false) {
+      for (const b of shift.blockers ?? []) stats.refused(`worker:${b.code}`);
+      continue;
+    }
     const req = await api.task('Worker requests a shift', 'care worker', () => api.post(`/api/v1/shifts/${shift.id}/requests`, w.token, {}));
     api.countTask('Worker requests a shift');
     if (req.status !== 201) {
@@ -951,21 +971,34 @@ export async function resolveDisputes(ctx: SimContext, org: SimOrg): Promise<voi
 
 /** Capacity flags: raise when spare, withdraw when the balance flips. */
 export async function manageFlags(ctx: SimContext, org: SimOrg, week: number): Promise<void> {
-  const { api, rng, clock, stats, gaps } = ctx;
+  const { api, rng, clock, stats, gaps, world } = ctx;
   const groups: RoleGroup[] = ['CARE', 'SENIOR', 'NURSE'];
   for (const g of groups) {
     const base = org.balance[g];
     const season = seasonal(week);
     let balance = base < 0 ? base * season : base * (2 - season);
     if (org.shock) balance = balance < 0 ? balance * org.shock.factor : balance / org.shock.factor;
-    const spareWorkers = org.workers.filter((w) => w.group === g && w.shareable && w.active).length;
-    if (balance >= 1 && spareWorkers > 0 && !org.activeSurplusFlag[g]) {
-      const hours = Math.min(Math.round(balance) * 8 * 2, spareWorkers * 24);
-      const res = await api.task('Raise a surplus flag', 'rota manager', () =>
-        api.post('/api/v1/capacity/flags', org.managerToken, { kind: 'SURPLUS', jobRole: g === 'CARE' ? 'CARE_ASSISTANT' : g === 'SENIOR' ? 'SENIOR_CARER' : 'NURSE', headcount: Math.max(1, Math.round(balance)), hoursRequested: hours, startsAt: iso(clock.now), endsAt: iso(clock.plusDays(14)), radiusKm: 30, note: 'Staff short of hours this fortnight' }),
-      );
+    const spare = org.workers.filter((w) => w.group === g && w.shareable && w.active);
+    if (balance >= 1 && spare.length > 0 && !org.activeSurplusFlag[g]) {
+      const headcount = Math.max(1, Math.round(balance));
+      const hours = Math.min(headcount * 8 * 2, spare.length * 24);
+      // Decision 8: contracted hours count against the 48-hour limit unless the employer names who is spare.
+      const released = rng.shuffle(spare).slice(0, Math.min(spare.length, Math.max(headcount, Math.ceil(hours / 12))));
+      const flag = { kind: 'SURPLUS', jobRole: g === 'CARE' ? 'CARE_ASSISTANT' : g === 'SENIOR' ? 'SENIOR_CARER' : 'NURSE', headcount, hoursRequested: hours, startsAt: iso(clock.now), endsAt: iso(clock.plusDays(14)), radiusKm: 30, note: 'Staff short of hours this fortnight' };
+      const withNames = world.features.flagWorkers !== false;
+      let res = await api.task('Raise a surplus flag', 'rota manager', () => api.post('/api/v1/capacity/flags', org.managerToken, withNames ? { ...flag, workerIds: released.map((w) => w.id) } : flag));
+      if (withNames && res.status === 400) {
+        world.features.flagWorkers = false; // an older API that does not take named staff
+        res = await api.task('Raise a surplus flag', 'rota manager', () => api.post('/api/v1/capacity/flags', org.managerToken, flag));
+      }
       api.countTask('Raise a surplus flag');
-      if (res.status === 201) org.activeSurplusFlag[g] = res.body.id;
+      if (res.status === 201) {
+        org.activeSurplusFlag[g] = res.body.id;
+        if (world.features.flagWorkers !== false) {
+          world.features.flagWorkers = true;
+          stats.current.workersReleased += res.body.workersReleased ?? released.length;
+        }
+      }
     } else if (balance < -0.5 && !org.activeSurplusFlag[g] && rng.chance(0.4) && org.type === 'PROVIDER') {
       const res = await api.task('Raise a shortage flag', 'rota manager', () =>
         api.post('/api/v1/capacity/flags', org.managerToken, { kind: 'SHORTAGE', jobRole: g === 'CARE' ? 'CARE_ASSISTANT' : g === 'SENIOR' ? 'SENIOR_CARER' : 'NURSE', headcount: Math.round(-balance), hoursRequested: Math.round(-balance) * 8 * 2, startsAt: iso(clock.now), endsAt: iso(clock.plusDays(14)) }),
@@ -996,7 +1029,6 @@ export async function manageFlags(ctx: SimContext, org: SimOrg, week: number): P
       proposal: 'Expiry and fulfilment reminders, one-click re-raise, recurring flags (e.g. "every week until occupancy recovers"), and a suggestion to flag when the platform sees a supplier\'s workers repeatedly eligible but idle.',
     });
   }
-  void stats;
 }
 
 /** Compliance renewals: officers renew expiring documents with a lag; some slip through. */
@@ -1059,7 +1091,7 @@ export async function monthEnd(ctx: SimContext, periodStart: Date, periodEnd: Da
     created = (run.body?.lines as any[]) ?? [];
     const hostInvoices = (run.body?.hostInvoices as any[]) ?? [];
     const remittances = (run.body?.remittances as any[]) ?? [];
-    ctx.log(`${fmtDate(clock.now)} settlement for ${fmtDate(periodStart)}–${fmtDate(periodEnd)}: ${hostInvoices.length} host invoice(s) £${hostInvoices.reduce((s, i) => s + (i.total ?? 0), 0).toFixed(0)}, ${remittances.length} remittance(s) £${remittances.reduce((s, i) => s + (i.total ?? 0), 0).toFixed(0)}, agency sales £${created.filter((l) => l.agencySale).reduce((s, l) => s + l.hostCost, 0).toFixed(0)}`);
+    ctx.log(`${fmtDate(clock.now)} settlement for ${fmtDate(periodStart)}–${fmtDate(periodEnd)}: ${hostInvoices.length} host invoice(s) £${hostInvoices.reduce((s, i) => s + (i.total ?? 0), 0).toFixed(0)}, ${remittances.length} remittance(s) £${remittances.reduce((s, i) => s + (i.total ?? 0), 0).toFixed(0)}, agency sales £${created.filter((l) => l.agencySale).reduce((s, l) => s + (l.subtotal ?? 0), 0).toFixed(0)}`);
     for (const inv of hostInvoices) {
       const host = world.org(inv.hostOrgId);
       pendingPayments.push({ invoiceId: inv.id, hostOrgId: inv.hostOrgId, dueAt: new Date(clock.now.getTime() + (host?.payLagDays ?? 30) * DAY), kind: 'host' });
@@ -1155,6 +1187,7 @@ export async function importWorkers(ctx: SimContext, org: SimOrg, count: number,
       travelRadiusKm: String(rng.pick([10, 15, 20, 25, 35])),
       homeSite: rng.pick(siteNames) ?? '',
       shareable: rng.chance(0.78) ? 'yes' : 'no',
+      verified: rng.chance(0.988) ? 'yes' : 'no', // the same share the one-at-a-time path verifies
       invite: invite ? 'yes' : 'no',
     };
     for (const type of requiredDocumentsForRole(jobRole)) {
@@ -1167,23 +1200,24 @@ export async function importWorkers(ctx: SimContext, org: SimOrg, count: number,
   }
   const headers = Array.from(new Set(rows.flatMap((r) => Object.keys(r))));
   const csv = [headers.join(','), ...rows.map((r) => headers.map((h) => `"${(r[h] ?? '').replace(/"/g, '""')}"`).join(','))].join('\n');
-  const preview = await api.task('Preview a worker import', 'HR manager', () => api.post('/api/v1/onboarding/import/preview', org.adminToken, { fileName: 'staff.csv', contentBase64: Buffer.from(csv).toString('base64') }));
+  const upload = { fileName: 'staff.csv', contentBase64: Buffer.from(csv).toString('base64') };
+  const preview = await api.task('Preview a worker import', 'HR manager', () => api.post('/api/v1/onboarding/import/preview', org.adminToken, upload));
   api.countTask('Preview a worker import');
   if (preview.status !== 200 && preview.status !== 201) {
     ctx.log(`import preview failed for ${org.name}: ${preview.status} ${JSON.stringify(preview.body).slice(0, 200)}`);
     return false;
   }
-  const apply = await api.task('Apply a worker import', 'HR manager', () => api.post(`/api/v1/onboarding/import/${preview.body.jobId}/apply`, org.adminToken, { invite: true }));
+  const apply = await api.task('Apply a worker import', 'HR manager', () => api.post(`/api/v1/onboarding/import/${preview.body.jobId}/apply`, org.adminToken, { ...upload, invite: true }));
   api.countTask('Apply a worker import');
   if (apply.status !== 200 && apply.status !== 201) {
     ctx.log(`import apply failed for ${org.name}: ${apply.status} ${JSON.stringify(apply.body).slice(0, 200)}`);
     return false;
   }
-  // Documents arrive unverified from a spreadsheet; the compliance officer verifies them in bulk.
+  // Rows the spreadsheet did not attest as checked land in the verification queue; the compliance officer clears it in bulk.
   const queue = await api.task('Review verification queue', 'compliance officer', () => api.get('/api/v1/compliance/verification-queue', org.adminToken));
   if (queue.status === 200) {
     api.countTask('Review verification queue');
-    const ids = ((queue.body as any[]) ?? []).map((d) => d.id ?? d.documentId).filter(Boolean);
+    const ids = ((queue.body as any[]) ?? []).map((d) => d.document?.id ?? d.id).filter(Boolean);
     for (let i = 0; i < ids.length; i += 200) {
       await api.task('Verify documents in bulk', 'compliance officer', () => api.post('/api/v1/compliance/verify', org.adminToken, { documentIds: ids.slice(i, i + 200) }));
       api.countTask('Verify documents in bulk');

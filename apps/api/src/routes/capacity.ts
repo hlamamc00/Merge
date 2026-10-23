@@ -1,14 +1,15 @@
 import { Router } from 'express';
-import { and, desc, eq } from 'drizzle-orm';
+import { and, desc, eq, inArray } from 'drizzle-orm';
 import { z } from 'zod';
-import { CapacityFlagKind, CapacityFlagStatus, JobRole } from '@merge/shared';
-import { capacityFlags, organisations, sites } from '../db/schema.js';
+import { CapacityFlagKind, CapacityFlagStatus, JobRole, startOfIsoWeek } from '@merge/shared';
+import { capacityFlags, organisations, sites, workers } from '../db/schema.js';
 import { auditFromReq } from '../lib/audit.js';
 import { MANAGERS, assertOrgAccess, isPlatformAdmin, requireAuth, requireRole } from '../lib/auth.js';
 import { auth, deps } from '../lib/context.js';
-import { conflict, h, notFound } from '../lib/errors.js';
+import { conflict, h, notFound, unprocessable } from '../lib/errors.js';
 import { parseBody, parseQuery, zDate } from '../lib/validate.js';
 import { createFlag, networkCapacity, withdrawFlag } from '../services/capacity.js';
+import { clearWeekHoursForFlag, releaseWorkersForFlag, releasedWorkerCounts } from '../services/weekHours.js';
 
 export const capacityRouter = Router();
 capacityRouter.use(requireAuth);
@@ -26,6 +27,10 @@ const zFlag = z
     postcodeAreas: z.array(z.string().trim().min(1).max(4)).max(50).nullable().optional(),
     radiusKm: z.number().positive().max(500).nullable().optional(),
     note: z.string().max(1000).nullable().optional(),
+    /** SURPLUS only: the staff who are free for the period (decision 8); they stop counting their contracted hours against the 48h limit. */
+    workerIds: z.array(z.string()).max(500).optional(),
+    /** Hours those staff still have with their employer each week of the flag (usually none). */
+    releasedHours: z.number().min(0).max(168).default(0),
   })
   .refine((b) => b.endsAt > b.startsAt, { message: 'endsAt must be after startsAt' });
 
@@ -51,7 +56,8 @@ capacityRouter.get(
       .where(conditions.length ? and(...conditions) : undefined)
       .orderBy(desc(capacityFlags.createdAt))
       .all();
-    res.json(rows.map(({ flag, orgName }) => ({ ...flag, orgName, hoursRemaining: Math.max(0, flag.hoursRequested - flag.hoursFilled) })));
+    const released = releasedWorkerCounts(db, rows.map((r) => r.flag.id));
+    res.json(rows.map(({ flag, orgName }) => ({ ...flag, orgName, hoursRemaining: Math.max(0, flag.hoursRequested - flag.hoursFilled), releasedWorkers: released.get(flag.id) ?? 0 })));
   }),
 );
 
@@ -64,15 +70,27 @@ capacityRouter.post(
   requireRole(...MANAGERS),
   h((req, res) => {
     const { db, now } = deps(req);
-    const body = parseBody(req, zFlag);
+    const { workerIds: rawWorkerIds, releasedHours, ...body } = parseBody(req, zFlag);
     const orgId = body.orgId ?? auth(req).org.id;
     assertOrgAccess(req, orgId);
     if (body.siteId && !db.select({ id: sites.id }).from(sites).where(and(eq(sites.id, body.siteId), eq(sites.orgId, orgId))).get()) throw notFound('Site');
+    if (rawWorkerIds !== undefined && body.kind !== CapacityFlagKind.SURPLUS) throw unprocessable('Only a surplus flag can name the staff it frees');
+    const workerIds = [...new Set(rawWorkerIds ?? [])];
+    if (workerIds.length > 0) {
+      // Only staff the employer could actually lend: active, shareable and their own.
+      const found = db
+        .select({ id: workers.id })
+        .from(workers)
+        .where(and(inArray(workers.id, workerIds), eq(workers.orgId, orgId), eq(workers.status, 'ACTIVE'), eq(workers.shareable, true)))
+        .all();
+      if (found.length !== workerIds.length) throw notFound('Worker');
+    }
     const at = now();
     if (body.endsAt.getTime() <= at.getTime()) throw conflict('The flag period has already ended');
     const flag = createFlag(db, auth(req).settings, { ...body, orgId, createdByUserId: auth(req).user.id }, at);
-    auditFromReq(req, db, { action: 'CREATE', entityType: 'capacity_flag', entityId: flag.id, data: { kind: flag.kind, jobRole: flag.jobRole, hoursRequested: flag.hoursRequested } }, at);
-    res.status(201).json({ ...flag, hoursRemaining: flag.hoursRequested });
+    if (workerIds.length > 0) releaseWorkersForFlag(db, flag, workerIds, releasedHours, auth(req).user.id, at);
+    auditFromReq(req, db, { action: 'CREATE', entityType: 'capacity_flag', entityId: flag.id, data: { kind: flag.kind, jobRole: flag.jobRole, hoursRequested: flag.hoursRequested, workersReleased: workerIds.length, releasedHours } }, at);
+    res.status(201).json({ ...flag, hoursRemaining: flag.hoursRequested, workersReleased: workerIds.length });
   }),
 );
 
@@ -87,7 +105,9 @@ capacityRouter.post(
     if (flag.status !== CapacityFlagStatus.ACTIVE) throw conflict(`Flag is already ${flag.status.toLowerCase()}`);
     const at = now();
     const updated = withdrawFlag(db, flag, at);
-    auditFromReq(req, db, { action: 'CANCEL', entityType: 'capacity_flag', entityId: flag.id }, at);
+    // The staff it freed count as rostered at home again from this week on; weeks already worked stay as recorded.
+    const restored = clearWeekHoursForFlag(db, flag.id, startOfIsoWeek(at));
+    auditFromReq(req, db, { action: 'CANCEL', entityType: 'capacity_flag', entityId: flag.id, data: restored ? { weekHoursCleared: restored } : undefined }, at);
     res.json(updated);
   }),
 );

@@ -145,6 +145,21 @@ export interface Unavailability {
   reason: string | null;
 }
 
+/** Decision 8: where the "hours with the employer" figure for a week comes from. */
+export type WeekHoursSource = 'RECORDED' | 'FLAG' | 'CONTRACT';
+
+/** One ISO week of a worker's hours with their own employer, as GET /workers/:id/weeks returns it. */
+export interface WorkerWeek {
+  /** Monday 00:00 Europe/London, ISO instant. */
+  weekStart: string;
+  /** The figure eligibility counts against the 48h limit for that week. */
+  internalHours: number;
+  contractedHoursPerWeek: number | null;
+  source: WeekHoursSource;
+  note: string | null;
+  sourceFlagId: string | null;
+}
+
 export interface WorkerDetail extends Worker {
   compliance: ComplianceSummary;
   documents: WorkerDocument[];
@@ -172,6 +187,8 @@ export interface CapacityFlag {
   note: string | null;
   status: CapacityFlagStatus;
   createdAt: string;
+  /** Staff a surplus flag named as free for the period (decision 8). */
+  releasedWorkers?: number;
 }
 
 export interface NetworkCapacity {

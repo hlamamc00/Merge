@@ -12,6 +12,8 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import type { AddressInfo } from 'node:net';
 import { createApp } from '../src/app.js';
+import { silentChannels } from '../src/services/mail.js';
+import { setOutboxChannels } from '../src/services/scheduler.js';
 import { openDatabase, runMigrations } from '../src/db/client.js';
 import type { NotificationChannel } from '../src/lib/notify.js';
 import { ApiClient, Clock, DAY, GapRegister, HOUR, Rng, fmtDate } from './lib.js';
@@ -92,6 +94,7 @@ async function main() {
       if (stats.current) stats.current.notificationsSent++;
     },
   };
+  setOutboxChannels(silentChannels); // emails stay in outbound_messages for the personas' mailboxes; nothing is printed
   const { app } = createApp({ db, now: () => clock.now, channels: [channel] });
   const server = app.listen(0);
   await new Promise<void>((r) => server.once('listening', () => r()));
@@ -179,7 +182,7 @@ async function main() {
     stats.current.timesheetsPendingEnd = ((pending.body as any[]) ?? []).length;
     try {
       const since = weekStart.getTime();
-      stats.current.escalatedShifts = (sqlite.prepare(`select count(*) c from shifts where escalation_step > 0 and published_at >= ?`).get(since) as { c: number }).c;
+      stats.current.escalatedShifts = (sqlite.prepare(`select count(*) c from shifts s join organisations o on o.id = s.host_org_id where s.escalation_step > 0 and o.escalation_mode = 'AUTO' and s.published_at >= ?`).get(since) as { c: number }).c;
       stats.current.emailsSent = (sqlite.prepare(`select count(*) c from outbound_messages where channel = 'EMAIL' and created_at >= ?`).get(since) as { c: number }).c;
     } catch {
       /* columns absent on an older API */
@@ -196,14 +199,23 @@ async function main() {
   await ev.probeNotificationVolume(ctx, notificationsPerOrgDay, notificationsByType);
   deriveGapsFromData(ctx, sqlite);
   deriveGapsFromWeeks(gaps, stats.weeks);
+  // How auto-escalated shifts ended: started with someone confirmed, or still unfilled.
+  let escalation: { shifts: number; filled: number; expired: number } | null = null;
+  try {
+    const row = sqlite.prepare(`select count(*) shifts, coalesce(sum(case when s.status in ('IN_PROGRESS','COMPLETED') then 1 else 0 end), 0) filled, coalesce(sum(case when s.status = 'EXPIRED' then 1 else 0 end), 0) expired from shifts s join organisations o on o.id = s.host_org_id where s.escalation_step > 0 and o.escalation_mode = 'AUTO' and s.status in ('IN_PROGRESS','COMPLETED','EXPIRED')`).get() as { shifts: number; filled: number; expired: number };
+    if (row.shifts > 0) escalation = row;
+  } catch {
+    /* columns absent on an older API */
+  }
 
   const elapsedMin = Math.round(((performance.now() - startedAt) / 60_000) * 10) / 10;
   const result = {
     config: { weeks: WEEKS, seed: SEED, start: SIM_START.toISOString(), stepHours: STEP_HOURS },
     elapsedMinutes: elapsedMin,
     apiCalls: api.calls.length,
-    providers: world.orgs.filter((o) => o.type === 'PROVIDER').map((o) => ({ name: o.name, size: o.size, staff: o.workers.length, sites: o.sites.length, joinWeek: o.joinWeek, status: o.status, noShowsCaused: o.noShowsCaused })),
+    providers: world.orgs.filter((o) => o.type === 'PROVIDER').map((o) => ({ name: o.name, size: o.size, staff: o.workers.length, sites: o.sites.length, joinWeek: o.joinWeek, status: o.status, noShowsCaused: o.noShowsCaused, onboarding: o.onboarding })),
     weeks: stats.weeks,
+    escalation,
     tasks: api.taskSummary().sort((a, b) => b.calls - a.calls),
     notificationsByType: Object.fromEntries(notificationsByType),
     gaps: gaps.list(),
@@ -344,10 +356,11 @@ function deriveGapsFromData(ctx: SimContext, sqlite: import('better-sqlite3').Da
   const noShows = stats.weeks.reduce((s, w) => s + w.noShows, 0);
   const existing = gaps.gaps.get('TRS-01');
   if (existing) existing.evidence += ` Over the run: ${late} late cancellations and ${noShows} no-shows network-wide.`;
-  // 4. Unfilled shifts: hosts received only an in-app warning 24h before.
+  // 4. Unfilled shifts with nothing escalating them (decision 6 added escalation; once it has run, this finding no longer applies).
   const expired = stats.weeks.reduce((s, w) => s + w.shiftsExpiredUnfilled, 0);
   const posted = stats.weeks.reduce((s, w) => s + w.shiftsPosted, 0);
-  if (expired > 0) {
+  const escalated = stats.weeks.reduce((s, w) => s + (w.escalatedShifts ?? 0), 0);
+  if (expired > 0 && escalated === 0) {
     gaps.record({
       id: 'DSP-01',
       title: 'Nothing escalates an unfilled shift: no auto-widening, rate uplift or agency fallback',

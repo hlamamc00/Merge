@@ -38,13 +38,17 @@ Roles: **PA** platform admin (agency), **OA** org admin, **OM** org manager, **W
 | PATCH | `/workers/:id/documents/:docId` | managers – include `verified: true|false` |
 | DELETE | `/workers/:id/documents/:docId` | managers |
 | POST/DELETE | `/workers/:id/unavailability[/:id]` | managers or the worker |
+| GET | `/workers/:id/weeks?from&to` | managers – hours with the employer per ISO week (decision 8): `[{ weekStart, internalHours, contractedHoursPerWeek, source: RECORDED\|FLAG\|CONTRACT, note, sourceFlagId }]`; defaults to this week and the eight after it |
+| PUT | `/workers/:id/weeks/:weekStart` | managers – `{ internalHours (0–168), note? }`; `:weekStart` is `YYYY-MM-DD` and must be a Monday (Europe/London), else `422`. Replaces the contracted hours in the 48h check for that week |
+| DELETE | `/workers/:id/weeks/:weekStart` | managers – back to the contracted hours (`204`) |
+| POST | `/workers/week-hours` | managers – `{ weekStart: 'YYYY-MM-DD', entries: [{ workerId, internalHours }] }` (1–500) → `{ updated }`; `404` unknown worker, `403` another organisation's |
 
 ## Capacity flags
 | Method | Path | Who |
 | --- | --- | --- |
-| GET | `/capacity/flags?orgId&status&kind` | managers |
-| POST | `/capacity/flags` | managers – `{ kind, jobRole?, headcount, hoursRequested, startsAt, endsAt, siteId?, postcodeAreas?, radiusKm?, note? }` |
-| POST | `/capacity/flags/:id/withdraw` | managers |
+| GET | `/capacity/flags?orgId&status&kind` | managers – each row carries `hoursRemaining` and `releasedWorkers` |
+| POST | `/capacity/flags` | managers – `{ kind, jobRole?, headcount, hoursRequested, startsAt, endsAt, siteId?, postcodeAreas?, radiusKm?, note?, workerIds?, releasedHours? }`. `workerIds` (SURPLUS only, else `422`; each must be an active, shareable worker of the organisation, else `404`) names the staff who are free: they are recorded with `releasedHours` (default 0) hours with their employer for every week of the flag (decision 8). Returns the flag plus `hoursRemaining` and `workersReleased` |
+| POST | `/capacity/flags/:id/withdraw` | managers – also puts the staff the flag freed back on their contracted hours from the current week on |
 | GET | `/capacity/network` | any – `{ summary[], flags? }` (flags itemised for PA only) |
 
 ## Shifts

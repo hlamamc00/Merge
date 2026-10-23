@@ -238,6 +238,29 @@ export const workerUnavailability = sqliteTable(
   (t) => ({ workerIdx: index('worker_unavailability_worker_idx').on(t.workerId) }),
 );
 
+/**
+ * Decision 8: the hours a worker is actually rostered for by their own employer in one ISO week.
+ * Absent a row, eligibility assumes the full contracted hours; a row (recorded by hand or by a
+ * surplus flag naming the worker) replaces that assumption for the week.
+ */
+export const workerWeekHours = sqliteTable(
+  'worker_week_hours',
+  {
+    id: text('id').primaryKey(),
+    workerId: text('worker_id').notNull().references(() => workers.id),
+    /** Monday 00:00 Europe/London of the week (startOfIsoWeek), as an instant. */
+    weekStart: ts('week_start').notNull(),
+    internalHours: real('internal_hours').notNull(),
+    note: text('note'),
+    /** Set when a surplus flag created the row, so withdrawing the flag can undo it. */
+    sourceFlagId: text('source_flag_id'),
+    setByUserId: text('set_by_user_id'),
+    createdAt: ts('created_at').notNull(),
+    updatedAt: ts('updated_at').notNull(),
+  },
+  (t) => ({ pairIdx: uniqueIndex('worker_week_hours_pair_idx').on(t.workerId, t.weekStart), flagIdx: index('worker_week_hours_flag_idx').on(t.sourceFlagId) }),
+);
+
 export const capacityFlags = sqliteTable(
   'capacity_flags',
   {
@@ -696,6 +719,7 @@ export type User = typeof users.$inferSelect;
 export type Site = typeof sites.$inferSelect;
 export type Worker = typeof workers.$inferSelect;
 export type WorkerDocument = typeof workerDocuments.$inferSelect;
+export type WorkerWeekHours = typeof workerWeekHours.$inferSelect;
 export type CapacityFlag = typeof capacityFlags.$inferSelect;
 export type Shift = typeof shifts.$inferSelect;
 export type ShiftAccessRow = typeof shiftAccess.$inferSelect;

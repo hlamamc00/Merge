@@ -1,11 +1,12 @@
+import { useQuery } from '@tanstack/react-query';
 import { useState, type FormEvent } from 'react';
 import { CapacityFlagKind, JOB_ROLE_LABELS, JobRole } from '@merge/shared';
 import { api } from '../api/client';
 import { useAction, useFlags, useNetworkCapacity, useSites } from '../api/hooks';
-import type { CapacityFlag } from '../api/types';
+import type { CapacityFlag, WorkerListItem } from '../api/types';
 import { useAuth } from '../auth/AuthContext';
 import { StatusBadge } from '../components/badges';
-import { Button, Card, EmptyState, ErrorBanner, Field, InfoBanner, Input, Loading, Modal, PageHeader, Progress, Select, Tabs, Textarea, cx } from '../components/ui';
+import { Button, Card, Checkbox, EmptyState, ErrorBanner, Field, InfoBanner, Input, Loading, Modal, PageHeader, Progress, Select, Tabs, Textarea, cx } from '../components/ui';
 import { fmtDate, fmtDateTime, toLocalInput, fromLocalInput } from '../lib/format';
 import { NetworkTable } from './DashboardPage';
 
@@ -63,6 +64,7 @@ function FlagRow({ flag, showOrg, onWithdraw, withdrawing }: { flag: CapacityFla
             {fmtDate(flag.startsAt)} – {fmtDate(flag.endsAt)}
             {flag.postcodeAreas?.length ? ` · areas ${flag.postcodeAreas.join(', ')}` : ''}
             {flag.radiusKm ? ` · within ${flag.radiusKm} km` : ''}
+            {flag.releasedWorkers ? ` · ${flag.releasedWorkers} staff named as free` : ''}
             {' · raised '}
             {fmtDateTime(flag.createdAt)}
           </div>
@@ -85,10 +87,17 @@ function RaiseFlagModal({ open, onClose }: { open: boolean; onClose: () => void 
   const end = new Date();
   end.setDate(end.getDate() + 14);
   const [form, setForm] = useState({ kind: 'SURPLUS' as CapacityFlagKind, jobRole: '', headcount: '1', hoursRequested: '40', startsAt: toLocalInput(start), endsAt: toLocalInput(end), siteId: '', postcodeAreas: '', radiusKm: '', note: '' });
+  const [workerIds, setWorkerIds] = useState<string[]>([]);
+  // Decision 8: a surplus flag can name the staff who are free, lifting their contracted hours from the 48h check.
+  // Scoped to the raising organisation: a platform admin's unscoped list would span every organisation.
+  const staff = useQuery({ queryKey: ['workers', { status: 'ACTIVE', orgId: organisation?.id }], queryFn: () => api.get<WorkerListItem[]>('/workers', { status: 'ACTIVE', orgId: organisation?.id }), enabled: open && form.kind === 'SURPLUS' });
+  const lendable = (staff.data ?? []).filter((w) => w.shareable && (!form.jobRole || w.jobRole === form.jobRole));
+  const toggleWorker = (id: string) => setWorkerIds((ids) => (ids.includes(id) ? ids.filter((x) => x !== id) : [...ids, id]));
   const create = useAction(
     () =>
       api.post('/capacity/flags', {
         kind: form.kind,
+        ...(form.kind === 'SURPLUS' ? { workerIds: workerIds.filter((id) => lendable.some((w) => w.id === id)) } : {}),
         jobRole: form.jobRole || null,
         headcount: Number(form.headcount),
         hoursRequested: Number(form.hoursRequested),
@@ -99,7 +108,10 @@ function RaiseFlagModal({ open, onClose }: { open: boolean; onClose: () => void 
         radiusKm: form.radiusKm ? Number(form.radiusKm) : null,
         note: form.note || null,
       }),
-    () => onClose(),
+    () => {
+      setWorkerIds([]);
+      onClose();
+    },
   );
   const submit = (e: FormEvent) => {
     e.preventDefault();
@@ -143,6 +155,22 @@ function RaiseFlagModal({ open, onClose }: { open: boolean; onClose: () => void 
           <Field label="Max distance (km)" hint="From your organisation's location."><Input type="number" min="1" value={form.radiusKm} onChange={(e) => setForm({ ...form, radiusKm: e.target.value })} /></Field>
         </div>
         <Field label="Note"><Textarea value={form.note} onChange={(e) => setForm({ ...form, note: e.target.value })} placeholder="e.g. Occupancy down after two discharges" /></Field>
+        {form.kind === 'SURPLUS' && (
+          <Field
+            label={<span className="flex items-center justify-between gap-2">Who is free for this period?{lendable.length > 0 && <button type="button" className="text-xs font-normal text-brand-700 hover:underline" onClick={() => setWorkerIds(lendable.map((w) => w.id))}>Select all shown</button>}</span>}
+            hint="Ticked staff are treated as having no rostered hours with you while the flag runs, so their contracted hours no longer count against the 48-hour limit when another organisation books them."
+          >
+            {staff.isLoading ? <Loading label="Loading staff…" /> : lendable.length === 0 ? (
+              <p className="text-sm text-slate-500">No active, shareable {form.jobRole ? JOB_ROLE_LABELS[form.jobRole as JobRole].toLowerCase() : 'staff'} to choose from.</p>
+            ) : (
+              <div className="grid max-h-48 gap-1 overflow-y-auto rounded-lg border border-slate-200 p-2 sm:grid-cols-2">
+                {lendable.map((w) => (
+                  <Checkbox key={w.id} label={`${w.firstName} ${w.lastName}`} hint={`${JOB_ROLE_LABELS[w.jobRole]}${w.contractedHoursPerWeek != null ? ` · ${w.contractedHoursPerWeek}h contracted` : ''}`} checked={workerIds.includes(w.id)} onChange={() => toggleWorker(w.id)} />
+                ))}
+              </div>
+            )}
+          </Field>
+        )}
       </form>
     </Modal>
   );
