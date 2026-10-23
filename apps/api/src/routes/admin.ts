@@ -43,6 +43,7 @@ adminRouter.patch(
         noShowPriorityPenaltyThreshold: z.number().int().min(1).max(50).optional(),
         noShowPriorityPenaltyDays: z.number().int().min(1).max(365).optional(),
         noShowSuspensionThreshold: z.number().int().min(1).max(50).optional(),
+        noShowRateThresholdPct: z.number().min(0).max(100).optional(),
         requestReminderHours: z.number().min(0).max(168).optional(),
         requestReminderBeforeStartHours: z.number().min(0).max(168).optional(),
         documentRetentionYears: z.number().int().min(1).max(30).optional(),

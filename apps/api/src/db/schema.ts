@@ -57,6 +57,8 @@ export const platformSettings = sqliteTable('platform_settings', {
   noShowPriorityPenaltyThreshold: integer('no_show_priority_penalty_threshold').notNull().default(2),
   noShowPriorityPenaltyDays: integer('no_show_priority_penalty_days').notNull().default(30),
   noShowSuspensionThreshold: integer('no_show_suspension_threshold').notNull().default(3),
+  /** The count thresholds only apply once no-shows are at least this share of the employer's bookings in the window. */
+  noShowRateThresholdPct: real('no_show_rate_threshold_pct').notNull().default(5),
   /** Decision 7: remind the operator about an unanswered request. */
   requestReminderHours: real('request_reminder_hours').notNull().default(12),
   requestReminderBeforeStartHours: real('request_reminder_before_start_hours').notNull().default(24),

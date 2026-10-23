@@ -21,7 +21,7 @@ const AGENCY_POSITION_HELP: Record<AgencyPosition, string> = {
 type Tab = 'approvals' | 'settings' | 'organisations' | 'shifts' | 'audit';
 
 /** Settings beyond the original dispatch/money fields (all optional so older API responses still type). */
-type FullSettings = PlatformSettings & { twoFactorRequiredForManagers?: boolean; mouVersion?: string; documentRetentionYears?: number; defaultEscalationMode?: 'MANUAL' | 'AUTO'; nationalMinimumWage?: number; employerOnCostPct?: number; noShowWindowDays?: number; noShowPriorityPenaltyThreshold?: number; noShowPriorityPenaltyDays?: number; noShowSuspensionThreshold?: number; requestReminderHours?: number; requestReminderBeforeStartHours?: number };
+type FullSettings = PlatformSettings & { twoFactorRequiredForManagers?: boolean; mouVersion?: string; documentRetentionYears?: number; defaultEscalationMode?: 'MANUAL' | 'AUTO'; nationalMinimumWage?: number; employerOnCostPct?: number; noShowWindowDays?: number; noShowPriorityPenaltyThreshold?: number; noShowPriorityPenaltyDays?: number; noShowSuspensionThreshold?: number; noShowRateThresholdPct?: number; requestReminderHours?: number; requestReminderBeforeStartHours?: number };
 
 export function AdminPage() {
   const [tab, setTab] = useState<Tab>('approvals');
@@ -118,6 +118,7 @@ function SettingsForm() {
             <Field label="No-shows before priority is removed"><Input type="number" min="1" {...num('noShowPriorityPenaltyThreshold')} /></Field>
             <Field label="Priority penalty length (days)"><Input type="number" min="1" {...num('noShowPriorityPenaltyDays')} /></Field>
             <Field label="No-shows before suspension"><Input type="number" min="1" {...num('noShowSuspensionThreshold')} /></Field>
+            <Field label="…and at least this share of bookings (%)" hint="So a large supplier is judged on its rate, not a raw count."><Input type="number" min="0" max="100" step="0.5" {...num('noShowRateThresholdPct')} /></Field>
             <Field label="Remind operator after (hours)" hint="Unanswered requests (decision 7)."><Input type="number" min="0" step="0.5" {...num('requestReminderHours')} /></Field>
             <Field label="…or this long before the start (hours)"><Input type="number" min="0" step="0.5" {...num('requestReminderBeforeStartHours')} /></Field>
           </div>

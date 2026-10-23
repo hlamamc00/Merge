@@ -1,0 +1,1 @@
+ALTER TABLE `platform_settings` ADD `no_show_rate_threshold_pct` real DEFAULT 5 NOT NULL;

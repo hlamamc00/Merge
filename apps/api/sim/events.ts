@@ -333,7 +333,18 @@ export async function probeDataSubjectRequest(ctx: SimContext, org: SimOrg): Pro
   api.countTask('Check notifications');
   const adminTold = ((adminInbox.body?.notifications as any[]) ?? []).some((n) => n.data?.kind === 'erasure-request' && n.data?.workerId === w.id);
   // The leaver from week 8 is inactive with no bookings ahead: their employer's admin erases the personal data.
-  const leaver = world.orgs.filter((o) => o.status === 'ACTIVE').flatMap((o) => o.workers.filter((x) => !x.active).map((x) => ({ org: o, w: x })))[0];
+  let leaver = world.orgs.filter((o) => o.status === 'ACTIVE').flatMap((o) => o.workers.filter((x) => !x.active).map((x) => ({ org: o, w: x })))[0];
+  if (!leaver) {
+    // No leaver at an active employer this run: HR deactivates someone who has left (releasing any bookings) and then erases them.
+    const candidate = org.workers.find((x) => x.active && !x.token && x.id !== w.id);
+    if (candidate) {
+      const off = await api.task('Deactivate a leaver', 'HR manager', () => api.patch(`/api/v1/workers/${candidate.id}`, org.adminToken, { status: 'INACTIVE' }));
+      if (off.status === 200) {
+        candidate.active = false;
+        leaver = { org, w: candidate };
+      }
+    }
+  }
   const erase = leaver ? await api.task('Erase a leaver\'s personal data', 'org admin', () => api.post(`/api/v1/workers/${leaver.w.id}/erase`, leaver.org.adminToken, { reason: 'Left the organisation; data no longer needed' })) : null;
   if (erase?.status === 200) api.countTask('Erase a leaver\'s personal data');
   const readBack = leaver ? await api.get(`/api/v1/workers/${leaver.w.id}`, leaver.org.adminToken) : null;

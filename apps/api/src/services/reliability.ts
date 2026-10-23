@@ -14,6 +14,8 @@ export interface Reliability {
   noShows: number;
   lateCancellations: number;
   confirmedOrCompleted: number;
+  /** No-shows as a share of bookings in the window (confirmed, completed and no-show). */
+  noShowRatePct: number;
   /** 100 = spotless; each no-show costs 15 points, each late cancellation 5. */
   score: number;
   priorityPenaltyUntil: Date | null;
@@ -38,6 +40,7 @@ export function reliabilityFor(db: Db, settings: PlatformSettingsRow, orgId: str
     noShows,
     lateCancellations,
     confirmedOrCompleted,
+    noShowRatePct: Math.round((noShows / Math.max(1, noShows + confirmedOrCompleted)) * 1000) / 10,
     score: Math.max(0, 100 - noShows * 15 - lateCancellations * 5),
     priorityPenaltyUntil: org?.priorityPenaltyUntil ?? null,
     status: org?.status ?? 'UNKNOWN',
@@ -57,17 +60,20 @@ export function applyNoShowConsequences(db: Db, notifier: Notifier, settings: Pl
   const owner = platformOwnerOrgId(db, settings);
   let penalised = false;
   let suspended = false;
-  if (r.noShows >= settings.noShowSuspensionThreshold && org.status === 'ACTIVE' && org.type !== OrgType.AGENCY) {
-    const reason = `${r.noShows} no-shows in ${settings.noShowWindowDays} days (threshold ${settings.noShowSuspensionThreshold})`;
+  // A large supplier doing hundreds of bookings reaches any absolute count; the penalties bite only when
+  // no-shows are also a meaningful share of its bookings (the simulation suspended a 250-staff supplier at 3.7%).
+  const rateMet = r.noShowRatePct >= settings.noShowRateThresholdPct;
+  if (rateMet && r.noShows >= settings.noShowSuspensionThreshold && org.status === 'ACTIVE' && org.type !== OrgType.AGENCY) {
+    const reason = `${r.noShows} no-shows in ${settings.noShowWindowDays} days, ${r.noShowRatePct}% of bookings (thresholds ${settings.noShowSuspensionThreshold} and ${settings.noShowRateThresholdPct}%)`;
     db.update(organisations).set({ status: 'SUSPENDED', suspendedReason: reason, updatedAt: now }).where(eq(organisations.id, org.id)).run();
     suspended = true;
     notifier.send({ orgId: org.id, type: NotificationType.SYSTEM, title: 'Your organisation has been suspended from the network', body: `${reason}. Contact the platform to discuss reinstatement; no-shows are a disciplinary matter for you as the employer.`, data: { kind: 'no-show-suspension', noShows: r.noShows } });
     if (owner) notifier.send({ orgId: owner, type: NotificationType.SYSTEM, title: `${org.name} suspended after repeated no-shows`, body: `${reason}. Review and reinstate from Platform admin when appropriate.`, data: { kind: 'no-show-suspension', orgId: org.id } });
-  } else if (r.noShows >= settings.noShowPriorityPenaltyThreshold && (!org.priorityPenaltyUntil || org.priorityPenaltyUntil.getTime() < now.getTime())) {
+  } else if (rateMet && r.noShows >= settings.noShowPriorityPenaltyThreshold && (!org.priorityPenaltyUntil || org.priorityPenaltyUntil.getTime() < now.getTime())) {
     const until = addDays(now, settings.noShowPriorityPenaltyDays);
     db.update(organisations).set({ priorityPenaltyUntil: until, updatedAt: now }).where(eq(organisations.id, org.id)).run();
     penalised = true;
-    notifier.send({ orgId: org.id, type: NotificationType.SYSTEM, title: 'Priority access removed after repeated no-shows', body: `${r.noShows} no-shows in the last ${settings.noShowWindowDays} days. Your surplus flags will not give you first access until ${until.toISOString().slice(0, 10)}. A further no-show may lead to suspension.`, data: { kind: 'no-show-penalty', until: until.toISOString() } });
+    notifier.send({ orgId: org.id, type: NotificationType.SYSTEM, title: 'Priority access removed after repeated no-shows', body: `${r.noShows} no-shows in the last ${settings.noShowWindowDays} days (${r.noShowRatePct}% of your bookings). Your surplus flags will not give you first access until ${until.toISOString().slice(0, 10)}. A further no-show may lead to suspension.`, data: { kind: 'no-show-penalty', until: until.toISOString() } });
     if (owner) notifier.send({ orgId: owner, type: NotificationType.SYSTEM, title: `${org.name} lost priority access after ${r.noShows} no-shows`, body: `Priority access suspended until ${until.toISOString().slice(0, 10)}.`, data: { kind: 'no-show-penalty', orgId: org.id } });
   }
   return { noShows: r.noShows, penalised, suspended };
