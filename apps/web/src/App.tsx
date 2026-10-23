@@ -72,7 +72,7 @@ export default function App() {
         <Route path="/workers/import" element={<RequireAuth manager><ImportWorkersPage /></RequireAuth>} />
         <Route path="/workers/:id" element={<WorkerDetailPage />} />
         <Route path="/compliance" element={<CompliancePage />} />
-        <Route path="/trust" element={<RequireAuth manager><TrustPage /></RequireAuth>} />
+        <Route path="/trust" element={<RequireAuth><TrustPage /></RequireAuth>} />
         <Route path="/finance" element={<RequireAuth admin><FinancePage /></RequireAuth>} />
         <Route path="/admin/finance" element={<RequireAuth platform><AgencyFinancePage /></RequireAuth>} />
         <Route path="/settings/notifications" element={<NotificationSettingsPage />} />

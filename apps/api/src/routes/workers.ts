@@ -11,6 +11,7 @@ import { HttpError, badRequest, conflict, forbidden, h, notFound } from '../lib/
 import { newId } from '../lib/ids.js';
 import { getStorage, newFileKey } from '../lib/storage.js';
 import { assertChanges, parseBody, parseQuery, zDate, zOptionalDate, zPostcode } from '../lib/validate.js';
+import { cancelFutureBookingsForWorker } from '../services/assignments.js';
 import { ALLOWED_DOCUMENT_MIME_TYPES, MAX_DOCUMENT_BYTES, activeDocuments, hostRequirementsForWorker, publicDocument } from '../services/compliance.js';
 
 export const workersRouter = Router();
@@ -190,6 +191,12 @@ workersRouter.patch(
     const at = now();
     db.update(workers).set({ ...patch, updatedAt: at }).where(eq(workers.id, worker.id)).run();
     auditFromReq(req, db, { action: 'UPDATE', entityType: 'worker', entityId: worker.id, data: body }, at);
+    if (changes.status && changes.status !== 'ACTIVE' && worker.status === 'ACTIVE') {
+      // WF-02: a leaver (or someone on leave) must not stay booked on shifts they will not work.
+      const reason = `Worker is ${changes.status.toLowerCase().replace('_', ' ')}`;
+      const released = cancelFutureBookingsForWorker(db, deps(req).notifier, auth(req).settings, worker.id, { userId: auth(req).user.id, orgId: worker.orgId }, reason, at);
+      if (released.withdrawn.length || released.cancelled.length) auditFromReq(req, db, { action: 'CANCEL', entityType: 'worker', entityId: worker.id, data: { released } }, at);
+    }
     res.json(db.select().from(workers).where(eq(workers.id, worker.id)).get());
   }),
 );

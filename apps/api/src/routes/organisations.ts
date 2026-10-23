@@ -66,7 +66,7 @@ organisationsRouter.patch(
     if ((body.status || body.suspendedReason !== undefined) && !isPlatformAdmin(req)) throw forbidden('Only the platform administrator can change an organisation\'s status');
     assertChanges(body);
     const at = now();
-    const statusExtras = body.status === 'ACTIVE' ? { suspendedReason: null } : {};
+    const statusExtras = body.status === 'ACTIVE' ? { suspendedReason: null, priorityPenaltyUntil: null } : {};
     db.update(organisations).set({ ...body, ...statusExtras, updatedAt: at }).where(eq(organisations.id, req.params.id!)).run();
     auditFromReq(req, db, { action: 'UPDATE', entityType: 'organisation', entityId: req.params.id!, data: body }, at);
     res.json(db.select().from(organisations).where(eq(organisations.id, req.params.id!)).get());
@@ -89,7 +89,7 @@ organisationsRouter.post(
     const blockers = approvalBlockers(org);
     if (blockers.length > 0 && !body.override) throw conflict('Organisation cannot be approved yet', { blockers });
     const at = now();
-    db.update(organisations).set({ status: 'ACTIVE', suspendedReason: null, updatedAt: at }).where(eq(organisations.id, org.id)).run();
+    db.update(organisations).set({ status: 'ACTIVE', suspendedReason: null, priorityPenaltyUntil: null, updatedAt: at }).where(eq(organisations.id, org.id)).run();
     auditFromReq(req, db, { action: 'APPROVE', entityType: 'organisation', entityId: org.id, data: { override: blockers.length > 0, overriddenBlockers: blockers.length > 0 ? blockers : undefined, note: body.note } }, at);
     notifier.send({ orgId: org.id, type: 'SYSTEM', title: 'Your organisation has been approved', body: `${org.name} is now active on the network: you can post shifts and make workers available.`, data: { organisationId: org.id } });
     res.json(db.select().from(organisations).where(eq(organisations.id, org.id)).get());

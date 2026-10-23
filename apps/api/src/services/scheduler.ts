@@ -1,14 +1,20 @@
-import { and, eq, gt, isNotNull, lte } from 'drizzle-orm';
+import { and, eq, gt, isNotNull, lt, lte } from 'drizzle-orm';
 import { DOCUMENT_LABELS, NotificationType, addDays } from '@merge/shared';
+import { config } from '../config.js';
 import type { Db } from '../db/client.js';
 import { notifications, workerDocuments, workers } from '../db/schema.js';
 import type { Notifier } from '../lib/notify.js';
+import { getStorage } from '../lib/storage.js';
 import { remindOperatorOfPendingRequests } from './assignments.js';
 import { expireFlags } from './capacity.js';
+import { drainOutbox, runDigest } from './delivery.js';
 import { notifyDueAccess } from './dispatch.js';
 import { runEscalations } from './escalation.js';
+import { createChannels, silentChannels, type Channels } from './mail.js';
 import { getSettings } from './settings.js';
+import { runFinanceJobs, type FinanceJobsResult } from './settlement.js';
 import { progressShifts, warnUnfilledSoon } from './shifts.js';
+import { autoApproveStaleTimesheets } from './timesheets.js';
 
 export interface TickResult {
   stagesOpened: number;
@@ -20,7 +26,27 @@ export interface TickResult {
   escalations: { auto: number; prompted: number };
   /** Decision 7: pending requests the platform owner was asked to chase. */
   operatorReminders: number;
+  /** Decision 1: invoices marked overdue, payment reminders, credit holds applied and released. */
+  finance: FinanceJobsResult;
+  /** Timesheets approved automatically after 14 days without a host decision. */
+  autoApproved: number;
+  /** Daily digest emails queued (once a day, after 07:00 UTC). */
+  digests: number;
+  /** Decision 18: superseded documents removed after the retention period. */
+  documentsPurged: number;
 }
+
+/** Mail/SMS channels for the outbox: the environment's SMTP (or console) in production, silent under test. */
+let outboxChannels: Channels | null = null;
+export function setOutboxChannels(channels: Channels | null): void {
+  outboxChannels = channels;
+}
+function channels(): Channels {
+  return outboxChannels ?? (config.isTest ? silentChannels : createChannels());
+}
+
+/** Daily jobs run once per calendar day per database, whenever the first tick after 07:00 UTC happens. */
+const lastDailyRun = new WeakMap<Db, string>();
 
 /** One pass of the background jobs. Idempotent, so it is safe to run as often as you like. */
 export function tick(db: Db, notifier: Notifier, now: Date): TickResult {
@@ -32,7 +58,36 @@ export function tick(db: Db, notifier: Notifier, now: Date): TickResult {
   const unfilledWarnings = warnUnfilledSoon(db, notifier, now);
   const operatorReminders = remindOperatorOfPendingRequests(db, notifier, settings, now);
   const documentAlerts = alertExpiringDocuments(db, notifier, now);
-  return { stagesOpened, flagsExpired, shifts: shiftsResult, unfilledWarnings, documentAlerts, escalations, operatorReminders };
+  const finance = runFinanceJobs(db, notifier, settings, now);
+  const autoApproved = autoApproveStaleTimesheets(db, notifier, now).length;
+  let digests = 0;
+  let documentsPurged = 0;
+  const day = now.toISOString().slice(0, 10);
+  if (now.getUTCHours() >= 7 && lastDailyRun.get(db) !== day) {
+    lastDailyRun.set(db, day);
+    digests = runDigest(db, now);
+    documentsPurged = purgeSupersededDocuments(db, settings.documentRetentionYears, now);
+  }
+  // Emails and texts queued by everything above go out through the configured channels; failures are logged, not thrown.
+  void drainOutbox(db, now, channels()).catch((err) => console.error('outbox delivery failed', err));
+  return { stagesOpened, flagsExpired, shifts: shiftsResult, unfilledWarnings, documentAlerts, escalations, operatorReminders, finance, autoApproved, digests, documentsPurged };
+}
+
+/**
+ * Decision 18: a corrected document is kept as history for the retention period, then removed
+ * (row and file). Current documents are never touched here.
+ */
+export function purgeSupersededDocuments(db: Db, retentionYears: number, now: Date): number {
+  const cutoff = new Date(now);
+  cutoff.setUTCFullYear(cutoff.getUTCFullYear() - Math.max(1, retentionYears));
+  const stale = db.select({ id: workerDocuments.id, fileKey: workerDocuments.fileKey }).from(workerDocuments).where(and(isNotNull(workerDocuments.supersededAt), lt(workerDocuments.supersededAt, cutoff))).all();
+  if (stale.length === 0) return 0;
+  const storage = getStorage();
+  for (const doc of stale) {
+    db.delete(workerDocuments).where(eq(workerDocuments.id, doc.id)).run();
+    if (doc.fileKey) void storage.delete(doc.fileKey).catch((err) => console.error(`could not delete file ${doc.fileKey}`, err));
+  }
+  return stale.length;
 }
 
 /** Tell employers about documents expiring in the next 30 days (at most one alert per document per week). */
@@ -77,7 +132,7 @@ export function startScheduler(db: Db, notifier: Notifier, intervalSeconds: numb
   const run = () => {
     try {
       const r = tick(db, notifier, now());
-      if (r.stagesOpened || r.flagsExpired || r.shifts.started || r.shifts.completed || r.shifts.expired || r.unfilledWarnings || r.documentAlerts || r.escalations.auto || r.escalations.prompted || r.operatorReminders) {
+      if (r.stagesOpened || r.flagsExpired || r.shifts.started || r.shifts.completed || r.shifts.expired || r.unfilledWarnings || r.documentAlerts || r.escalations.auto || r.escalations.prompted || r.operatorReminders || r.finance.markedOverdue || r.finance.reminders || r.finance.holdsApplied || r.finance.holdsCleared || r.autoApproved || r.digests || r.documentsPurged) {
         log(`scheduler: ${JSON.stringify(r)}`);
       }
     } catch (err) {

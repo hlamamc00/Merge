@@ -31,7 +31,7 @@ export function Layout() {
     { to: '/workers', label: 'Workers', icon: '☺', show: isManager },
     { to: '/workers/import', label: 'Import workers', icon: '⇪', show: isManager },
     { to: '/compliance', label: isWorker ? 'My documents' : 'Compliance', icon: '✓', show: true },
-    { to: '/trust', label: 'Trust & safety', icon: '⚠', show: isManager },
+    { to: '/trust', label: isWorker ? 'Where I can work' : 'Trust & safety', icon: '⚠', show: true },
     { to: '/timesheets', label: 'Timesheets', icon: '◷', show: true },
     { to: '/statements', label: 'Statements', icon: '£', show: isAdmin },
     { to: '/finance', label: 'Finance', icon: '◇', show: isAdmin },
@@ -95,6 +95,14 @@ export function Layout() {
           </div>
           <div className="flex items-center gap-2">
             <NotificationBell />
+            <Link to="/settings/notifications" className="hidden rounded-lg px-2.5 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-100 sm:inline" title="Email, text and digest preferences">
+              Alerts
+            </Link>
+            {isManager && (
+              <Link to="/setup-2fa" className="hidden rounded-lg px-2.5 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-100 sm:inline" title="Authenticator app">
+                Security
+              </Link>
+            )}
             <button
               type="button"
               onClick={() => {

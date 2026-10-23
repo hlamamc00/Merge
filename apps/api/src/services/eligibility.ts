@@ -39,7 +39,8 @@ export function evaluateWorkerForShift(
   now: Date,
   opts: { allowHoursOverride?: boolean } = {},
 ): WorkerShiftEvaluation {
-  const documents = db.select().from(workerDocuments).where(eq(workerDocuments.workerId, worker.id)).all();
+  // Corrected documents stay as history (supersededAt set) and must not count towards compliance.
+  const documents = db.select().from(workerDocuments).where(and(eq(workerDocuments.workerId, worker.id), isNull(workerDocuments.supersededAt))).all();
   // Decision 7: only firm bookings count as booked time; requests and offers elsewhere are soft holds (warned below).
   const booked = db
     .select({ startsAt: shifts.startsAt, endsAt: shifts.endsAt, breakMinutes: shifts.breakMinutes })

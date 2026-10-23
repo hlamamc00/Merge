@@ -5,7 +5,7 @@ import { DocumentType, JobRole, ShiftStatus, ShiftVisibility, Skill, UserRole, c
 import type { Db } from '../db/client.js';
 import { capacityFlags, organisations, ratings, shiftAccess, shiftAssignments, shiftSeries, shifts, sites, workerDocuments, workers, type Shift } from '../db/schema.js';
 import { auditFromReq } from '../lib/audit.js';
-import { MANAGERS, assertOrgAccess, isManager, isPlatformAdmin, requireAuth, requireRole } from '../lib/auth.js';
+import { MANAGERS, allowedSiteIds, assertOrgAccess, assertSiteAccess, isManager, isPlatformAdmin, requireAuth, requireRole } from '../lib/auth.js';
 import { auth, deps } from '../lib/context.js';
 import { conflict, forbidden, h, notFound, unprocessable } from '../lib/errors.js';
 import { parseBody, parseQuery, zDate, zQueryBool } from '../lib/validate.js';
@@ -101,6 +101,7 @@ shiftsRouter.post(
     assertOrgAccess(req, hostOrgId);
     const site = loadSiteForOrg(db, body.template.siteId, hostOrgId);
     if (!site) throw notFound('Site');
+    assertSiteAccess(req, site.id);
     const at = now();
     const occurrences = body.occurrences ?? expandPattern(body.pattern!);
     const { hostOrgId: _h, ...template } = body.template;
@@ -196,11 +197,12 @@ shiftsRouter.get(
       if (!isManager(req)) throw forbidden();
       const hostOrgId = q.orgId ?? org.id;
       assertOrgAccess(req, hostOrgId);
+      const allowedSites = allowedSiteIds(req); // a site-limited manager sees only their sites' rota
       const rows = db
         .select({ shift: shifts, site: sites })
         .from(shifts)
         .innerJoin(sites, eq(sites.id, shifts.siteId))
-        .where(and(eq(shifts.hostOrgId, hostOrgId), ...base, q.includePast ? undefined : gte(shifts.endsAt, at)))
+        .where(and(eq(shifts.hostOrgId, hostOrgId), ...base, q.includePast ? undefined : gte(shifts.endsAt, at), allowedSites ? inArray(shifts.siteId, allowedSites) : undefined))
         .orderBy(asc(shifts.startsAt))
         .all();
       const ids = rows.map((r) => r.shift.id);
@@ -304,6 +306,7 @@ shiftsRouter.post(
     assertOrgAccess(req, hostOrgId);
     const site = loadSiteForOrg(db, body.siteId, hostOrgId);
     if (!site) throw notFound('Site');
+    assertSiteAccess(req, site.id);
     const at = now();
     const { publish, hostOrgId: _h, ...data } = body;
     const shift = createShift(db, notifier, settings, { hostOrgId, site, data, publish, createdByUserId: user.id, allowPending: isPlatformAdmin(req) }, at);
@@ -312,6 +315,13 @@ shiftsRouter.post(
     res.status(201).json({ ...publicShift(shift), site, plan: planForShift(db, shift.id) });
   }),
 );
+
+/** Host-side actions: the caller's organisation must own the shift and a site-limited manager must cover its site. */
+function assertHostShiftAccess(req: Parameters<typeof deps>[0], shift: { hostOrgId: string; siteId: string }) {
+  assertOrgAccess(req, shift.hostOrgId);
+  const allowed = allowedSiteIds(req);
+  if (allowed && !allowed.includes(shift.siteId)) throw forbidden('You are not assigned to that site');
+}
 
 function loadShift(req: Parameters<typeof deps>[0], id: string) {
   const { db } = deps(req);
@@ -402,11 +412,12 @@ shiftsRouter.patch(
     const { db, now, notifier } = deps(req);
     const { settings } = auth(req);
     const { shift } = loadShift(req, req.params.id!);
-    assertOrgAccess(req, shift.hostOrgId);
+    assertHostShiftAccess(req, shift);
     const at = now();
     if (shift.status === ShiftStatus.DRAFT) {
       const body = parseBody(req, zShift.innerType().omit({ publish: true, hostOrgId: true }).partial());
       if (body.siteId && !loadSiteForOrg(db, body.siteId, shift.hostOrgId)) throw notFound('Site');
+      if (body.siteId) assertSiteAccess(req, body.siteId);
       if (body.chargeRate !== undefined) assertRateAboveFloor(settings, body.chargeRate);
       if (body.requiredHostRequirementIds) body.requiredHostRequirementIds = assertHostRequirementIds(db, shift.hostOrgId, body.requiredHostRequirementIds);
       db.update(shifts).set({ ...body, updatedAt: at }).where(eq(shifts.id, shift.id)).run();
@@ -440,7 +451,7 @@ shiftsRouter.post(
     const { db, now, notifier } = deps(req);
     const { settings } = auth(req);
     const { shift, site } = loadShift(req, req.params.id!);
-    assertOrgAccess(req, shift.hostOrgId);
+    assertHostShiftAccess(req, shift);
     if (shift.status !== ShiftStatus.DRAFT) throw conflict('Only draft shifts can be published');
     assertHostMayPublish(db, shift.hostOrgId, { allowPending: isPlatformAdmin(req) });
     const at = now();
@@ -458,7 +469,7 @@ shiftsRouter.post(
   h((req, res) => {
     const { db, now, notifier } = deps(req);
     const { shift } = loadShift(req, req.params.id!);
-    assertOrgAccess(req, shift.hostOrgId);
+    assertHostShiftAccess(req, shift);
     if (!['DRAFT', 'OPEN', 'FILLED'].includes(shift.status)) throw conflict(`A ${shift.status.toLowerCase().replace('_', ' ')} shift cannot be cancelled`);
     const body = parseBody(req, z.object({ reason: z.string().max(500).nullable().optional() }));
     const at = now();
@@ -476,7 +487,7 @@ shiftsRouter.post(
     const { db, now, notifier } = deps(req);
     const { user, settings } = auth(req);
     const { shift } = loadShift(req, req.params.id!);
-    assertOrgAccess(req, shift.hostOrgId);
+    assertHostShiftAccess(req, shift);
     const body = parseBody(req, z.object({ raiseRatePct: z.number().min(0).max(100).optional(), openToAll: z.boolean().default(true) }));
     if (shift.status !== ShiftStatus.OPEN) throw conflict(`A ${shift.status.toLowerCase().replace('_', ' ')} shift cannot be escalated`);
     if (!body.raiseRatePct && !body.openToAll) throw unprocessable('Raise the rate, open to all, or both');
@@ -494,7 +505,7 @@ shiftsRouter.post(
     const { db, now, notifier } = deps(req);
     const { user, settings } = auth(req);
     const { shift, site } = loadShift(req, req.params.id!);
-    assertOrgAccess(req, shift.hostOrgId);
+    assertHostShiftAccess(req, shift);
     const body = parseBody(req, z.object({ startsAt: zDate, endsAt: zDate, publish: z.boolean().default(false), chargeRate: z.number().positive().max(500).optional() }).refine((b) => b.endsAt > b.startsAt, { message: 'endsAt must be after startsAt' }));
     const at = now();
     const copy = createShift(
@@ -541,7 +552,7 @@ shiftsRouter.get(
     const { db, now } = deps(req);
     const { settings } = auth(req);
     const { shift, site } = loadShift(req, req.params.id!);
-    assertOrgAccess(req, shift.hostOrgId);
+    assertHostShiftAccess(req, shift);
     if (shift.status !== ShiftStatus.DRAFT) return res.json({ persisted: true, urgent: shift.urgent, entries: planForShift(db, shift.id) });
     const at = now();
     const plan = buildPlan(db, settings, shift, site, at, at);
@@ -599,7 +610,7 @@ shiftsRouter.get(
     const { db, now } = deps(req);
     const { settings } = auth(req);
     const { shift, site } = loadShift(req, req.params.id!);
-    assertOrgAccess(req, shift.hostOrgId);
+    assertHostShiftAccess(req, shift);
     const at = now();
     const openOrgs = db.select({ orgId: shiftAccess.orgId, tier: shiftAccess.tier }).from(shiftAccess).where(and(eq(shiftAccess.shiftId, shift.id), lte(shiftAccess.opensAt, at))).all();
     if (openOrgs.length === 0) return res.json([]);
@@ -686,7 +697,7 @@ shiftsRouter.post(
     const { db, now, notifier } = deps(req);
     const { user, settings } = auth(req);
     const { shift, site } = loadShift(req, req.params.id!);
-    assertOrgAccess(req, shift.hostOrgId);
+    assertHostShiftAccess(req, shift);
     const body = parseBody(req, z.object({ workerId: z.string() }));
     const worker = db.select().from(workers).where(eq(workers.id, body.workerId)).get();
     if (!worker) throw notFound('Worker');
